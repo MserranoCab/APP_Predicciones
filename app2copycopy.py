@@ -47,6 +47,57 @@ os.makedirs(SEEDS_DIR, exist_ok=True)
 
 st.set_page_config(page_title="Cyber Attacks Forecaster", page_icon="🛡️", layout="wide")
 
+# ---- Download seed dataset from Secrets (Dropbox) on first run ----
+# Put DATA_URL in Streamlit Secrets. We download once into SEEDS_DIR so
+# _bootstrap_seed_data() will merge it automatically into the master dataset.
+import requests
+
+DATA_URL = st.secrets.get("DATA_URL", "")
+
+def _have_any_master() -> bool:
+    # master parquet folder has parts?
+    if os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR):
+        return True
+    # legacy master.csv?
+    if os.path.exists(MASTER_CSV):
+        return True
+    return False
+
+def ensure_secret_seed_download():
+    """If there is no data yet and a DATA_URL secret exists, download a seed CSV."""
+    if not DATA_URL:
+        return
+    if _have_any_master():
+        return
+    # if any CSV already present in seeds/, skip
+    if glob.glob(os.path.join(SEEDS_DIR, "*.csv")):
+        return
+
+    os.makedirs(SEEDS_DIR, exist_ok=True)
+    dest = os.path.join(SEEDS_DIR, "seed_from_link.csv")
+    if os.path.exists(dest):
+        return
+
+    with st.spinner("Downloading initial dataset (first run only)…"):
+        with requests.get(DATA_URL, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+            done = 0
+            chunk = 1024 * 1024 * 8  # 8MB
+            prog = st.progress(0)
+            with open(dest, "wb") as f:
+                for part in r.iter_content(chunk_size=chunk):
+                    if part:
+                        f.write(part)
+                        done += len(part)
+                        if total:
+                            prog.progress(min(done / total, 1.0))
+            prog.empty()
+    st.success("Seed CSV downloaded. It will be merged into master on this run.")
+
+# Kick it off before any bootstrapping
+ensure_secret_seed_download()
+
 # =================================
 # ---- 1) PROCESSING FUNCTIONS ----
 # =================================

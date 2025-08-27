@@ -449,6 +449,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
 
     try:
         for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
+            # Minimum columns
             if "Addition Info" not in df.columns: df["Addition Info"] = np.nan
             if "attack_result" not in df.columns: df["attack_result"] = np.nan
             if "Attack Start Time" not in df.columns:
@@ -467,7 +468,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
             df["Day"]  = ts.dt.date
             df["Hour"] = ts.dt.hour
 
-            # Normalize text columns so Arrow uses large_string
+            # String-like columns → pandas string dtype (Arrow large_string)
             TEXTY_COLS = [
                 "Addition Info","Threat Name","Threat Type","Threat Subtype",
                 "Source IP","Destination IP","Attacker","Victim",
@@ -477,7 +478,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 if c in df.columns:
                     df[c] = df[c].astype("string")
 
-            # Lock first-chunk schema; align subsequent chunks
+            # Lock first chunk columns; align later chunks
             if cols_ref is None:
                 cols_ref = list(df.columns)
             else:
@@ -502,7 +503,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         if writer is not None:
             writer.close()
 
-    # Summary
+    # quick placeholder summary to keep the UI happy
     if fast_mode:
         pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
     else:
@@ -514,58 +515,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
     return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
 
-    # Stream → enrich → append to a single parquet file
-    for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
-        # Minimum columns
-        if "Addition Info" not in df.columns: df["Addition Info"] = np.nan
-        if "attack_result" not in df.columns: df["attack_result"] = np.nan
-        if "Attack Start Time" not in df.columns:
-            if "First Seen" in df.columns:
-                df["Attack Start Time"] = pd.to_datetime(df["First Seen"], errors="coerce")
-            else:
-                raise ValueError("CSV must include 'Attack Start Time' column.")
-
-        # Enrichment (vectorized parse of Addition Info)
-        df = _vectorized_parse(df)
-        df = map_attack_result(df)
-        df = create_attack_signature(df)
-
-        ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
-        df["Attack Start Time"] = ts
-        df["Day"]  = ts.dt.date
-        df["Hour"] = ts.dt.hour
-
-        # Append this chunk to a single parquet file (row groups)
-        TEXTY_COLS = [
-    "Addition Info","Threat Name","Threat Type","Threat Subtype",
-    "Source IP","Destination IP","Attacker","Victim",
-    "direction","Severity","attack_result","attack_result_label"
-]
-        for c in TEXTY_COLS:
-            if c in df.columns:
-                df[c] = df[c].astype("string")   # pandas string dtype -> Arrow large_string
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        if not Path(out_parquet).exists():
-            pq.write_table(table, out_parquet, compression="zstd", use_dictionary=True)
-       
-        rows_done += len(df)
-        prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
-
-    # Build the recurrence summary from the enriched parquet
-    if not fast_mode:
-        # Build the recurrence summary from the enriched parquet (can be expensive)
-        df_all = pq.read_table(out_parquet).to_pandas()
-        df_final = calculate_recurrence(df_all)
-        df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]], on="attack_signature", how="left")
-        df_final.to_csv(output_path, index=False)
-    else:
-        # Write a tiny placeholder summary so the download button won’t break if you reference it
-        pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
-
-    prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
-    return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
-
-
+   
 # ===============================
 # ---- 2) DATA LAYER / CACHE ----
 # ===============================

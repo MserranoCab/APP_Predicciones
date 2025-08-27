@@ -45,6 +45,40 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 os.makedirs(SEEDS_DIR, exist_ok=True)
 
+# ---- Download seed dataset from Secrets (Dropbox) on first run ----
+import requests
+DATA_URL = st.secrets.get("DATA_URL", "")
+
+def _have_any_master() -> bool:
+    return (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) or os.path.exists(MASTER_CSV)
+
+def ensure_secret_seed_download():
+    # If we already have data or no secret is set, skip.
+    if not DATA_URL or _have_any_master() or glob.glob(os.path.join(SEEDS_DIR, "*.csv")):
+        return
+    os.makedirs(SEEDS_DIR, exist_ok=True)
+    dest = os.path.join(SEEDS_DIR, "seed_from_link.csv")
+    if os.path.exists(dest):
+        return
+    with st.spinner("Downloading initial dataset (first run only)…"):
+        with requests.get(DATA_URL, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+            done, chunk = 0, 8 * 1024 * 1024  # 8 MB
+            prog = st.progress(0)
+            with open(dest, "wb") as f:
+                for part in r.iter_content(chunk_size=chunk):
+                    if part:
+                        f.write(part)
+                        done += len(part)
+                        if total:
+                            prog.progress(min(done / total, 1.0))
+            prog.empty()
+    st.success("Seed CSV downloaded. It will be merged into master on this run.")
+
+ensure_secret_seed_download()
+
+
 st.set_page_config(page_title="Cyber Attacks Forecaster", page_icon="🛡️", layout="wide")
 
 # ---- Download seed dataset from Secrets (Dropbox) on first run ----
@@ -613,6 +647,22 @@ def _bootstrap_seed_data():
     # If we already have any master data (parquet parts or legacy CSV), skip.
     if (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) or os.path.exists(MASTER_CSV):
         return
+
+    paths = _discover_seed_paths()
+    if not paths:
+        return
+
+    for p in paths:
+        try:
+            # Stream-process -> enriched parquet, then append that part to master
+            result = _merge_or_process_seed(p)  # dict from process_log_csv_with_progress
+            _update_master_with_processed(result)  # adds parquet part; no huge DataFrame in RAM
+        except Exception as e:
+            st.warning(f"Seed load failed for {p}: {e}")
+
+    with open(SEED_FLAG, "w") as f:
+        f.write(dt.datetime.now().isoformat())
+
 
     paths = _discover_seed_paths()
     if not paths:

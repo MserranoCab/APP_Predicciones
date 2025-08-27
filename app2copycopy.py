@@ -992,6 +992,7 @@ if "seed_done" not in st.session_state:
             st.error(f"Bootstrap failed: {e}")
 
 # Sidebar: data status
+# Sidebar: data status
 with st.sidebar:
     st.header("📦 Data Status")
     st.caption(f"Master parts found: {len(glob.glob(os.path.join(MASTER_DS_DIR, '*.parquet')))}")
@@ -1003,10 +1004,7 @@ with st.sidebar:
         start, end, n = cov
         st.success(f"Data from **{start}** to **{end}**  \nRows: **{n:,}**")
 
-        tt_list = (
-            sorted(list(map,str, master.get("Threat Type", pd.Series(dtype=str)).dropna().unique())))
-            if not master.empty else []
-        )
+        tt_list = sorted(list(map(str, master.get("Threat Type", pd.Series(dtype=str)).dropna().unique()))) if not master.empty else []
         st.write(f"Threat Types ({len(tt_list)}):")
         st.write(", ".join(tt_list[:30]) + (" ..." if len(tt_list) > 30 else ""))
 
@@ -1014,7 +1012,7 @@ with st.sidebar:
             snapshot_path = os.path.join(DATA_DIR, "master_snapshot.parquet")
             pq.write_table(pa.Table.from_pandas(master, preserve_index=False), snapshot_path, compression="zstd")
             st.download_button("⬇️ Download master.parquet",
-                               data=open(snapshot_path, "database").read(),
+                               data=open(snapshot_path, "rb").read(),
                                file_name="master.parquet",
                                mime="application/octet-stream")
         except Exception as e:

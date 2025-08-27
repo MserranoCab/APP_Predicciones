@@ -27,6 +27,9 @@ plt.rcParams.update({"figure.autolayout": True})
 # =========================
 # ---- CONFIG / STORAGE ----
 # =========================
+st.set_page_config(page_title="Cyber Attacks Forecaster", page_icon="🛡️", layout="wide")
+
+
 DATA_DIR = "data"
 MODELS_DIR = "models"
 PLOTS_DIR = "plots"
@@ -49,6 +52,8 @@ os.makedirs(SEEDS_DIR, exist_ok=True)
 import requests
 DATA_URL = st.secrets.get("DATA_URL", "")
 SKIP_BOOTSTRAP = st.secrets.get("SKIP_BOOTSTRAP", "0") == "1"
+if not SKIP_BOOTSTRAP:
+    ensure_secret_seed_download()
 
 def _have_any_master() -> bool:
     return (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) or os.path.exists(MASTER_CSV)
@@ -80,7 +85,6 @@ def ensure_secret_seed_download():
 ensure_secret_seed_download()
 
 
-st.set_page_config(page_title="Cyber Attacks Forecaster", page_icon="🛡️", layout="wide")
 
 # ---- Download seed dataset from Secrets (Dropbox) on first run ----
 # Put DATA_URL in Streamlit Secrets. We download once into SEEDS_DIR so
@@ -453,6 +457,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 else:
                     raise ValueError("CSV must include 'Attack Start Time' column.")
 
+            # Enrichment
             df = _vectorized_parse(df)
             df = map_attack_result(df)
             df = create_attack_signature(df)
@@ -462,6 +467,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
             df["Day"]  = ts.dt.date
             df["Hour"] = ts.dt.hour
 
+            # Normalize text columns so Arrow uses large_string
             TEXTY_COLS = [
                 "Addition Info","Threat Name","Threat Type","Threat Subtype",
                 "Source IP","Destination IP","Attacker","Victim",
@@ -471,7 +477,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 if c in df.columns:
                     df[c] = df[c].astype("string")
 
-            # lock first chunk's columns; align later chunks
+            # Lock first-chunk schema; align subsequent chunks
             if cols_ref is None:
                 cols_ref = list(df.columns)
             else:
@@ -496,7 +502,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         if writer is not None:
             writer.close()
 
-    # quick placeholder summary to keep the UI happy
+    # Summary
     if fast_mode:
         pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
     else:
@@ -507,23 +513,6 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
 
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
     return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
-
-
-    def _vectorized_parse(df_chunk: pd.DataFrame) -> pd.DataFrame:
-        s = df_chunk["Addition Info"].fillna("")
-        ext = (
-            s.str.extractall(addinfo_re)
-             .reset_index()
-             .rename(columns={"level_0": "row", "key": "k", "val": "v"})
-        )
-        if ext.empty:
-            return df_chunk
-        wide = ext.pivot(index="row", columns="k", values="v")
-        wide.columns = [str(c).strip() for c in wide.columns]
-        wide = wide.reset_index()
-        out = df_chunk.reset_index(drop=True).reset_index().merge(wide, left_on="index", right_on="row", how="left")
-        out = out.drop(columns=["index","row"])
-        return out
 
     # Stream → enrich → append to a single parquet file
     for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):

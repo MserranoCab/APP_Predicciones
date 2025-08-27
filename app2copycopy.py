@@ -1167,7 +1167,6 @@ else:
                 continue
 
             saved = load_model_cached(bundle["model_path"])
-            saved = load_model_cached(bundle["model_path"])
             model_bundle = {
             "model": saved["model"],
             "features": saved["features"],

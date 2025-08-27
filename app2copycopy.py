@@ -599,33 +599,35 @@ def _discover_seed_paths() -> list:
             seen.add(c); uniq.append(c)
     return uniq
 
-def _merge_or_process_seed(path: str) -> pd.DataFrame:
-    df_try = pd.read_csv(path, low_memory=False)
-    if "attack_signature" in df_try.columns and ("Day" in df_try.columns or "First Seen" in df_try.columns):
-        if "Attack Start Time" not in df_try.columns and "First Seen" in df_try.columns:
-            df_try["Attack Start Time"] = pd.to_datetime(df_try["First Seen"], errors="coerce")
-        return df_try
+def _merge_or_process_seed(path: str):
+    """
+    Stream-process a BIG seed CSV and append its enriched parquet to master,
+    without loading the whole file in RAM.
+    Returns the dict produced by process_log_csv_with_progress.
+    """
     outp = os.path.join(PROCESSED_DIR, f"seed_{os.path.basename(path)}")
-    return process_log_csv(path, outp)
+    return process_log_csv_with_progress(path, outp, chunksize=250_000, fast_mode=True)
+
 
 def _bootstrap_seed_data():
-    if os.path.exists(MASTER_CSV):
+    # If we already have any master data (parquet parts or legacy CSV), skip.
+    if (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) or os.path.exists(MASTER_CSV):
         return
+
     paths = _discover_seed_paths()
     if not paths:
         return
-    frames = []
+
     for p in paths:
         try:
-            frames.append(_merge_or_process_seed(p))
+            # Stream-process p -> enriched parquet; then append that part to master
+            result = _merge_or_process_seed(p)  # dict from process_log_csv_with_progress
+            _update_master_with_processed(result)  # adds the parquet part; no big DataFrame in RAM
         except Exception as e:
             st.warning(f"Seed load failed for {p}: {e}")
-    if frames:
-        master = pd.concat(frames, ignore_index=True)
-        master = _dedupe_master(master)
-        _write_master(master)
-        with open(SEED_FLAG, "w") as f:
-            f.write(dt.datetime.now().isoformat())
+
+    with open(SEED_FLAG, "w") as f:
+        f.write(dt.datetime.now().isoformat())
 
 # ==================================================
 # ---- 3) FEATURES / MODEL TRAINING  ----

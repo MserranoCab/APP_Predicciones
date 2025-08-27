@@ -409,21 +409,114 @@ def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
     # Return RAW so master is updated at raw level
     return df
 
-def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: int = 250_000, fast_mode: bool = True):
+def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: int = 100_000, fast_mode: bool = True):
     """
-    Stream-read CSV in chunks, enrich each chunk, and write a SINGLE parquet file
-    for the *enriched raw* rows. Also writes the recurrence summary CSV.
-    RETURNS: dict with {"parquet_path": <path>, "rows": <int>}
+    Stream-read CSV in chunks, enrich each chunk, and append to ONE parquet file
+    (row groups) without ever reloading previous data into RAM.
+    Also writes a tiny CSV summary in fast_mode.
+    RETURNS: {"parquet_path": <path>, "rows": <int>, "fast_mode": <bool>}
     """
     prog = st.progress(0.0, text="Leyendo CSV…")
     rows_done = 0
 
-    # Where we will write the enriched raw parquet for this upload
     out_parquet = output_path.replace(".csv", ENRICH_SUFFIX_PARQUET)
-    Path(out_parquet).unlink(missing_ok=True)  # clean previous
+    Path(out_parquet).unlink(missing_ok=True)  # clean previous file if any
 
-    # Precompile regex for speed
     addinfo_re = re.compile(r'type=(?P<key>[^ \t]+)\s+value=(?P<val>[^;,\n]+)')
+
+    def _vectorized_parse(df_chunk: pd.DataFrame) -> pd.DataFrame:
+        s = df_chunk["Addition Info"].fillna("")
+        ext = (
+            s.str.extractall(addinfo_re)
+             .reset_index()
+             .rename(columns={"level_0": "row", "key": "k", "val": "v"})
+        )
+        if ext.empty:
+            return df_chunk
+        wide = ext.pivot(index="row", columns="k", values="v")
+        wide.columns = [str(c).strip() for c in wide.columns]
+        wide = wide.reset_index()
+        out = df_chunk.reset_index(drop=True).reset_index().merge(wide, left_on="index", right_on="row", how="left")
+        out = out.drop(columns=["index","row"])
+        return out
+
+    writer = None          # pyarrow ParquetWriter
+    schema = None          # arrow schema locked on first chunk
+    cols_ref = None        # column order locked on first chunk
+
+    try:
+        for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
+            # Ensure minimum columns
+            if "Addition Info" not in df.columns: df["Addition Info"] = np.nan
+            if "attack_result" not in df.columns: df["attack_result"] = np.nan
+            if "Attack Start Time" not in df.columns:
+                if "First Seen" in df.columns:
+                    df["Attack Start Time"] = pd.to_datetime(df["First Seen"], errors="coerce")
+                else:
+                    raise ValueError("CSV must include 'Attack Start Time' column.")
+
+            # Enrichment
+            df = _vectorized_parse(df)
+            df = map_attack_result(df)
+            df = create_attack_signature(df)
+
+            ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+            df["Attack Start Time"] = ts
+            df["Day"]  = ts.dt.date
+            df["Hour"] = ts.dt.hour
+
+            # Normalize texty cols (stable Arrow types)
+            TEXTY_COLS = [
+                "Addition Info","Threat Name","Threat Type","Threat Subtype",
+                "Source IP","Destination IP","Attacker","Victim",
+                "direction","Severity","attack_result","attack_result_label"
+            ]
+            for c in TEXTY_COLS:
+                if c in df.columns:
+                    df[c] = df[c].astype("string")
+
+            # Lock first-chunk columns; on later chunks, align + drop extras
+            if cols_ref is None:
+                cols_ref = list(df.columns)
+            else:
+                for c in cols_ref:
+                    if c not in df.columns:
+                        df[c] = pd.NA
+                df = df.reindex(columns=cols_ref)
+
+            table = pa.Table.from_pandas(df, preserve_index=False)
+
+            if writer is None:
+                schema = table.schema
+                writer = pq.ParquetWriter(out_parquet, schema=schema, compression="zstd", use_dictionary=True)
+            else:
+                # Cast to first schema to guarantee compatibility
+                table = table.cast(schema)
+
+            writer.write_table(table)
+
+            rows_done += len(df)
+            # lightweight progress (don’t tie to file size; chunk count is ok)
+            prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
+
+    finally:
+        if writer is not None:
+            writer.close()
+
+    # Optional lightweight summary
+    if not fast_mode:
+        # Read once at the end only (might be big) — keep it disabled by default
+        df_all = pq.read_table(out_parquet).to_pandas()
+        df_final = calculate_recurrence(df_all)
+        df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]], on="attack_signature", how="left")
+        df_final.to_csv(output_path, index=False)
+    else:
+        pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
+
+    prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
+    return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
+
+
 
     def _vectorized_parse(df_chunk: pd.DataFrame) -> pd.DataFrame:
         s = df_chunk["Addition Info"].fillna("")
@@ -607,8 +700,7 @@ def _bootstrap_seed_data():
 
     for p in paths:
         try:
-            # Stream-process -> enriched parquet, then append part to master (no big concat)
-            result = _merge_or_process_seed(p)  # dict from process_log_csv_with_progress
+            result = _merge_or_process_seed(p)   # dict from process_log_csv_with_progress
             _update_master_with_processed(result)
         except Exception as e:
             st.warning(f"Seed load failed for {p}: {e}")

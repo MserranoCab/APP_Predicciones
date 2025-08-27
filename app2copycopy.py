@@ -56,7 +56,9 @@ if not SKIP_BOOTSTRAP:
     ensure_secret_seed_download()
 
 def _have_any_master() -> bool:
-    return (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) or os.path.exists(MASTER_CSV)
+    # was: (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) ...
+    return bool(glob.glob(os.path.join(MASTER_DS_DIR, "*.parquet"))) or os.path.exists(MASTER_CSV)
+
 
 def ensure_secret_seed_download():
     # If we already have data or no secret is set, skip.
@@ -109,15 +111,9 @@ def read_master_cached():
     return _read_master()
 
 def _read_master_parquet() -> pd.DataFrame:
-    """
-    Robustly load all parquet parts under MASTER_DS_DIR by first determining
-    a single target Arrow dtype per column, casting each part to that dtype,
-    padding missing columns with nulls, then concatenating. Finally, parse
-    'Attack Start Time' back to pandas datetime and (re)build Day/Hour.
-    """
-    if not os.path.isdir(MASTER_DS_DIR) or not os.listdir(MASTER_DS_DIR):
+    part_paths = sorted(glob.glob(os.path.join(MASTER_DS_DIR, "*.parquet")))
+    if not part_paths:
         return pd.DataFrame()
-
     qdir = os.path.join(MASTER_DS_DIR, "_quarantine")
     os.makedirs(qdir, exist_ok=True)
 
@@ -613,10 +609,9 @@ def _merge_or_process_seed(path: str):
     outp = os.path.join(PROCESSED_DIR, f"seed_{os.path.basename(path)}")
     return process_log_csv_with_progress(path, outp, chunksize=250_000, fast_mode=True)
 
-
 def _bootstrap_seed_data():
-    # Skip if master already exists (parquet parts or legacy CSV)
-    if (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) or os.path.exists(MASTER_CSV):
+    # was checking os.listdir(MASTER_DS_DIR)
+    if glob.glob(os.path.join(MASTER_DS_DIR, "*.parquet")) or os.path.exists(MASTER_CSV):
         return
 
     paths = _discover_seed_paths()

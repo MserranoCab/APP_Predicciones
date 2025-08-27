@@ -1,5 +1,3 @@
-# app.py — Cyber Attack Forecasting Tool (Streamlit + XGBoost)
-
 import os
 import re
 import glob
@@ -17,7 +15,7 @@ from sklearn.preprocessing import LabelEncoder
 from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pyarrow.dataset as ds  
+import pyarrow.dataset as ds
 import pyarrow.compute as pc
 import pyarrow.types as patypes
 
@@ -28,7 +26,6 @@ plt.rcParams.update({"figure.autolayout": True})
 # ---- CONFIG / STORAGE ----
 # =========================
 st.set_page_config(page_title="Cyber Attacks Forecaster", page_icon="🛡️", layout="wide")
-
 
 DATA_DIR = "data"
 MODELS_DIR = "models"
@@ -52,13 +49,9 @@ os.makedirs(SEEDS_DIR, exist_ok=True)
 import requests
 DATA_URL = st.secrets.get("DATA_URL", "")
 SKIP_BOOTSTRAP = st.secrets.get("SKIP_BOOTSTRAP", "0") == "1"
-if not SKIP_BOOTSTRAP:
-    ensure_secret_seed_download()
 
 def _have_any_master() -> bool:
-    # was: (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) ...
     return bool(glob.glob(os.path.join(MASTER_DS_DIR, "*.parquet"))) or os.path.exists(MASTER_CSV)
-
 
 def ensure_secret_seed_download():
     # If we already have data or no secret is set, skip.
@@ -84,13 +77,11 @@ def ensure_secret_seed_download():
             prog.empty()
     st.success("Seed CSV downloaded. It will be merged into master on this run.")
 
-ensure_secret_seed_download()
-
-
-
-# ---- Download seed dataset from Secrets (Dropbox) on first run ----
-# Put DATA_URL in Streamlit Secrets. We download once into SEEDS_DIR so
-# _bootstrap_seed_data() will merge it automatically into the master dataset.
+# ---- Helper to refresh caches and rerun ----
+def _bust_caches_and_rerun():
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.rerun()
 
 # =================================
 # ---- 1) PROCESSING FUNCTIONS ----
@@ -308,7 +299,6 @@ def _get_series_first(df: pd.DataFrame, colname: str):
         return obj.iloc[:, 0]
     return obj
 
-
 def parse_addition_info_column(df: pd.DataFrame) -> pd.DataFrame:
     def parse(info_str):
         if pd.isna(info_str):
@@ -324,7 +314,6 @@ def parse_addition_info_column(df: pd.DataFrame) -> pd.DataFrame:
     df_out = coalesce_columns(df, parsed_df)
     return df_out
 
-
 def map_attack_result(df: pd.DataFrame) -> pd.DataFrame:
     result_map = {"1": "Attempted", "2": "Successful", 1: "Attempted", 2: "Successful"}
     s = get_first_series(df, "attack_result")
@@ -337,8 +326,6 @@ def map_attack_result(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_resource(show_spinner=False)
 def load_model_cached(path: str):
     return joblib.load(path)
-
-
 
 def create_attack_signature(df: pd.DataFrame) -> pd.DataFrame:
     signature_cols = [
@@ -377,7 +364,6 @@ def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
     """
     df = pd.read_csv(input_path, low_memory=False)
     df = _normalize_and_uniquify_columns(df)
-
 
     # Ensure core columns exist
     if "Addition Info" not in df.columns:
@@ -511,7 +497,6 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
     return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
 
-   
 # ===============================
 # ---- 2) DATA LAYER / CACHE ----
 # ===============================
@@ -546,7 +531,6 @@ def _dedupe_master(df: pd.DataFrame) -> pd.DataFrame:
         df = df.sort_values("Attack Start Time")
     # drop exact-duplicate rows across all columns
     return df.drop_duplicates(keep="first")
-
 
 def _dedupe_events_by_signature_time(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -627,7 +611,6 @@ def _bootstrap_seed_data():
 
     with open(SEED_FLAG, "w") as f:
         f.write(dt.datetime.now().isoformat())
-
 
 # ==================================================
 # ---- 3) FEATURES / MODEL TRAINING  ----
@@ -741,8 +724,6 @@ def _add_lags_rolls(subset: pd.DataFrame, threat: str):
 
     return subset, cfg
 
-
-
 def _enough_history(subset, horizon_hours: int) -> bool:
     return len(subset) >= max(200, int(horizon_hours * 3))
 
@@ -818,7 +799,6 @@ def train_xgb_for_threat(master_df: pd.DataFrame, threat: str, test_days: int = 
         "train": train, "test": test,
         "validation": {"val_mae": val_mae, "val_rmse": val_rmse, "resid_std_log": resid_std_log}
     }
-
 
 def forecast_recursive(
     master_df: pd.DataFrame,
@@ -935,7 +915,6 @@ def forecast_recursive(
 
     return pd.DataFrame(rows)
 
-
 def plot_recent_and_forecast(
     threat: str,
     recent_actual: pd.DataFrame,
@@ -957,7 +936,6 @@ def plot_recent_and_forecast(
     ax.legend()
     return fig
 
-
 # Optional: pretrain all models with sidebar spinner/progress
 def pretrain_models(master_df: pd.DataFrame):
     threats = sorted(master_df['Threat Type'].dropna().astype(str).unique())
@@ -973,7 +951,9 @@ def pretrain_models(master_df: pd.DataFrame):
     total = len(threats)
     for i, threat in enumerate(threats, start=1):
         with st.spinner(f"Training {threat} ({i}/{total})…"):
-            bundle = train_xgb_for_threat(master_df, threat, test_days=7)
+            bundle = train_xgb_for_threat(master_df, threat, test_days=
+
+7)
 
         with st.sidebar:
             if bundle is None:
@@ -992,24 +972,29 @@ def pretrain_models(master_df: pd.DataFrame):
 st.title("🛡️ Predicción de Ataques")
 st.caption("Subir Información → Procesar → Entrenar → Predecir")
 
-
-
 # First-run seeding with visible status (prevents blank screen)
 if "seed_done" not in st.session_state:
     with st.status("Initializing data (first run only)…", expanded=True) as s:
         try:
             if not SKIP_BOOTSTRAP:
+                # 1) if needed, download a seed CSV into seeds/
+                ensure_secret_seed_download()
+                # 2) process any CSVs found in seeds/ or env var
                 _bootstrap_seed_data()
+
             st.session_state["seed_done"] = True
             s.update(label="Initialization complete", state="complete")
+            # new parquet parts may exist now → refresh cached master and rerun
+            _bust_caches_and_rerun()
+
         except Exception as e:
             s.update(label="Initialization failed", state="error")
             st.error(f"Bootstrap failed: {e}")
 
-
 # Sidebar: data status
 with st.sidebar:
     st.header("📦 Data Status")
+    st.caption(f"Master parts found: {len(glob.glob(os.path.join(MASTER_DS_DIR, '*.parquet')))}")
 
     master = read_master_cached()  # now reads from the parquet dataset folder
     cov = _coverage_stats(master)
@@ -1019,7 +1004,7 @@ with st.sidebar:
         st.success(f"Data from **{start}** to **{end}**  \nRows: **{n:,}**")
 
         tt_list = (
-            sorted(list(map(str, master.get("Threat Type", pd.Series(dtype=str)).dropna().unique())))
+            sorted(list(map,str, master.get("Threat Type", pd.Series(dtype=str)).dropna().unique())))
             if not master.empty else []
         )
         st.write(f"Threat Types ({len(tt_list)}):")
@@ -1029,7 +1014,7 @@ with st.sidebar:
             snapshot_path = os.path.join(DATA_DIR, "master_snapshot.parquet")
             pq.write_table(pa.Table.from_pandas(master, preserve_index=False), snapshot_path, compression="zstd")
             st.download_button("⬇️ Download master.parquet",
-                               data=open(snapshot_path, "rb").read(),
+                               data=open(snapshot_path, "database").read(),
                                file_name="master.parquet",
                                mime="application/octet-stream")
         except Exception as e:
@@ -1099,9 +1084,8 @@ if process_btn and uploaded is not None:
 
         # 4) merge into master (append parquet part)
         st.write("Fusionando con el conjunto maestro…")
-        master = _update_master_with_processed(result)   # <-- use result, not df_processed
+        master = _update_master_with_processed(result)
         after_rows = len(master)
-
 
         status.update(label="Procesamiento completado ✅", state="complete")
 
@@ -1115,8 +1099,10 @@ if process_btn and uploaded is not None:
         mime="text/csv"
     )
 
-    # 🔁 force a rerun so the sidebar Data Status refreshes immediately
+    # force a fresh view of the sidebar Data Status
     st.session_state["_refresh_after_merge"] = True
+    st.cache_data.clear()
+    st.cache_resource.clear()
     st.rerun()
 
 st.divider()
@@ -1169,14 +1155,13 @@ else:
             "resid_std_log": saved.get("resid_std_log", 0.10),  # <-- added
         }
 
-
             fcst = forecast_recursive(master, threat, horizon_days=int(horizon_choice), model_bundle=model_bundle)
             if isinstance(fcst, dict) and fcst.get("insufficient_history"):
                 st.warning(f"**{threat}**: No hay suficiente historial con funciones listas para usar {horizon_choice}d "
                            f"(needed ~{fcst['needed']}, available {fcst['available']}). Try a shorter horizon.")
                 continue
 
-            grouped = grouped_all[grouped_all["Threat Type"] == threat].copy()
+            grouped = grouped_all[grouped_all[" Threat Type"] == threat].copy()
             grouped["ds"] = pd.to_datetime(grouped["ds"], errors="coerce")
 
             # Start of forecast (first predicted hour)
@@ -1192,15 +1177,14 @@ else:
                 (grouped["ds"] < fcst_start)
             ]
 
-            fig = plot_recent_and_forecast(
+            fig = plot_recent_andbundled_and_forecast(
                 threat,
                 recent_actual,
                 fcst,
-                lookback_hours=lookback_hours,
+                lookr_ho lookback_hours=lookback_hours,
                 title_suffix=f"(+{horizon_choice}d)"
             )
             st.pyplot(fig)
-
 
             plot_path = os.path.join(PLOTS_DIR, f"{re.sub('[^A-Za-z0-9]+','_', threat)}_{horizon_choice}d.png")
             fig.savefig(plot_path, dpi=160)
@@ -1224,7 +1208,7 @@ st.markdown("""
 - **Valores atípicos**: se recorta el 2% superior de los recuentos por hora.
 - **Límites de horizonte**: 7/14/30 días con comprobación de suficiencia del historial.
 - **Las funciones adicionales** (`Severity`, `attack_result_label`, `direction`, `duration`) se fusionan por hora cuando están disponibles.
-- **Persistencia**: los datos sembrados/fusionados se guardan en `data/master.csv` y se reutilizan en los reinicios.
+- **Persistencia**: los datos sembrados/fusionados se guardan en `data/master_parquet/` y se reutilizan en los reinicios.
 - **Bootstrapping**: se colocan los CSV de referencia en `seeds/` o se establece `CYBER_SEED_CSVS="/path/a.csv,/path/b.csv"`.
 """)
 

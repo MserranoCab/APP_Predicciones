@@ -48,6 +48,7 @@ os.makedirs(SEEDS_DIR, exist_ok=True)
 # ---- Download seed dataset from Secrets (Dropbox) on first run ----
 import requests
 DATA_URL = st.secrets.get("DATA_URL", "")
+SKIP_BOOTSTRAP = st.secrets.get("SKIP_BOOTSTRAP", "0") == "1"
 
 def _have_any_master() -> bool:
     return (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) or os.path.exists(MASTER_CSV)
@@ -412,15 +413,13 @@ def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
 def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: int = 100_000, fast_mode: bool = True):
     """
     Stream-read CSV in chunks, enrich each chunk, and append to ONE parquet file
-    (row groups) without ever reloading previous data into RAM.
-    Also writes a tiny CSV summary in fast_mode.
-    RETURNS: {"parquet_path": <path>, "rows": <int>, "fast_mode": <bool>}
+    without ever reloading previous data into RAM.
     """
     prog = st.progress(0.0, text="Leyendo CSV…")
     rows_done = 0
 
     out_parquet = output_path.replace(".csv", ENRICH_SUFFIX_PARQUET)
-    Path(out_parquet).unlink(missing_ok=True)  # clean previous file if any
+    Path(out_parquet).unlink(missing_ok=True)  # start fresh
 
     addinfo_re = re.compile(r'type=(?P<key>[^ \t]+)\s+value=(?P<val>[^;,\n]+)')
 
@@ -440,13 +439,12 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         out = out.drop(columns=["index","row"])
         return out
 
-    writer = None          # pyarrow ParquetWriter
-    schema = None          # arrow schema locked on first chunk
-    cols_ref = None        # column order locked on first chunk
+    writer = None
+    schema = None
+    cols_ref = None
 
     try:
         for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
-            # Ensure minimum columns
             if "Addition Info" not in df.columns: df["Addition Info"] = np.nan
             if "attack_result" not in df.columns: df["attack_result"] = np.nan
             if "Attack Start Time" not in df.columns:
@@ -455,7 +453,6 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 else:
                     raise ValueError("CSV must include 'Attack Start Time' column.")
 
-            # Enrichment
             df = _vectorized_parse(df)
             df = map_attack_result(df)
             df = create_attack_signature(df)
@@ -465,7 +462,6 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
             df["Day"]  = ts.dt.date
             df["Hour"] = ts.dt.hour
 
-            # Normalize texty cols (stable Arrow types)
             TEXTY_COLS = [
                 "Addition Info","Threat Name","Threat Type","Threat Subtype",
                 "Source IP","Destination IP","Attacker","Victim",
@@ -475,7 +471,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 if c in df.columns:
                     df[c] = df[c].astype("string")
 
-            # Lock first-chunk columns; on later chunks, align + drop extras
+            # lock first chunk's columns; align later chunks
             if cols_ref is None:
                 cols_ref = list(df.columns)
             else:
@@ -490,32 +486,27 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 schema = table.schema
                 writer = pq.ParquetWriter(out_parquet, schema=schema, compression="zstd", use_dictionary=True)
             else:
-                # Cast to first schema to guarantee compatibility
                 table = table.cast(schema)
 
             writer.write_table(table)
 
             rows_done += len(df)
-            # lightweight progress (don’t tie to file size; chunk count is ok)
             prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
-
     finally:
         if writer is not None:
             writer.close()
 
-    # Optional lightweight summary
-    if not fast_mode:
-        # Read once at the end only (might be big) — keep it disabled by default
+    # quick placeholder summary to keep the UI happy
+    if fast_mode:
+        pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
+    else:
         df_all = pq.read_table(out_parquet).to_pandas()
         df_final = calculate_recurrence(df_all)
         df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]], on="attack_signature", how="left")
         df_final.to_csv(output_path, index=False)
-    else:
-        pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
 
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
     return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
-
 
 
     def _vectorized_parse(df_chunk: pd.DataFrame) -> pd.DataFrame:
@@ -567,12 +558,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         table = pa.Table.from_pandas(df, preserve_index=False)
         if not Path(out_parquet).exists():
             pq.write_table(table, out_parquet, compression="zstd", use_dictionary=True)
-        else:
-            # Append by opening a new writer and writing both old and new (safe & simple)
-            old = pq.read_table(out_parquet)
-            merged = pa.concat_tables([old, table], promote=True)  
-            pq.write_table(merged, out_parquet, compression="zstd", use_dictionary=True)
-
+       
         rows_done += len(df)
         prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
 
@@ -1078,12 +1064,14 @@ st.caption("Subir Información → Procesar → Entrenar → Predecir")
 if "seed_done" not in st.session_state:
     with st.status("Initializing data (first run only)…", expanded=True) as s:
         try:
-            _bootstrap_seed_data()
+            if not SKIP_BOOTSTRAP:
+                _bootstrap_seed_data()
             st.session_state["seed_done"] = True
             s.update(label="Initialization complete", state="complete")
         except Exception as e:
             s.update(label="Initialization failed", state="error")
             st.error(f"Bootstrap failed: {e}")
+
 
 # Sidebar: data status
 with st.sidebar:

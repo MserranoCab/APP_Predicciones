@@ -644,7 +644,7 @@ def _merge_or_process_seed(path: str):
 
 
 def _bootstrap_seed_data():
-    # If we already have any master data (parquet parts or legacy CSV), skip.
+    # Skip if master already exists (parquet parts or legacy CSV)
     if (os.path.isdir(MASTER_DS_DIR) and os.listdir(MASTER_DS_DIR)) or os.path.exists(MASTER_CSV):
         return
 
@@ -654,30 +654,15 @@ def _bootstrap_seed_data():
 
     for p in paths:
         try:
-            # Stream-process -> enriched parquet, then append that part to master
+            # Stream-process -> enriched parquet, then append part to master (no big concat)
             result = _merge_or_process_seed(p)  # dict from process_log_csv_with_progress
-            _update_master_with_processed(result)  # adds parquet part; no huge DataFrame in RAM
+            _update_master_with_processed(result)
         except Exception as e:
             st.warning(f"Seed load failed for {p}: {e}")
 
     with open(SEED_FLAG, "w") as f:
         f.write(dt.datetime.now().isoformat())
 
-
-    paths = _discover_seed_paths()
-    if not paths:
-        return
-
-    for p in paths:
-        try:
-            # Stream-process p -> enriched parquet; then append that part to master
-            result = _merge_or_process_seed(p)  # dict from process_log_csv_with_progress
-            _update_master_with_processed(result)  # adds the parquet part; no big DataFrame in RAM
-        except Exception as e:
-            st.warning(f"Seed load failed for {p}: {e}")
-
-    with open(SEED_FLAG, "w") as f:
-        f.write(dt.datetime.now().isoformat())
 
 # ==================================================
 # ---- 3) FEATURES / MODEL TRAINING  ----

@@ -1255,6 +1255,12 @@ if fetch_btn and url_in:
         base_no_ext = os.path.join(DATA_DIR, f"remote_{ts_tag}")
         csv_local_path = download_url_to_csv(url_in, base_no_ext)
         st.write(f"Saved to: `{csv_local_path}`")
+        
+        # Show a small preview to catch HTML/garbage early
+        st.write("Preview of downloaded file (first ~1KB):")
+        with open(csv_local_path, "rb") as fh:
+            preview = fh.read(1024).decode(errors="ignore")
+        st.code(preview)
 
         processed_path = os.path.join(PROCESSED_DIR, f"processed_{ts_tag}.csv")
         st.write("Reading & enriching CSV…")

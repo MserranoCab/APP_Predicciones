@@ -466,6 +466,97 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
     return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
 
+# ---------- URL ingest helpers ----------
+def _normalize_direct_download(url: str) -> str:
+    url = url.strip()
+
+    # Dropbox: turn ?dl=0 into a direct download
+    if "dropbox.com" in url:
+        if "dl=0" in url:
+            url = url.replace("dl=0", "dl=1")
+        elif "dl=1" not in url and "raw=1" not in url:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}dl=1"
+
+    # Google Drive share → uc?export=download
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)", url)
+    if m:
+        file_id = m.group(1)
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    m = re.search(r"drive\.google\.com/open\?id=([^&]+)", url)
+    if m:
+        file_id = m.group(1)
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    return url
+
+
+def download_url_to_csv(url: str, base_path_no_ext: str) -> str:
+    """
+    Streams a remote file to disk and returns a *CSV path*.
+    Accepts .csv, .gz, .zip (first CSV inside).
+    """
+    import io, gzip, zipfile
+
+    url = _normalize_direct_download(url)
+    with st.status(f"Fetching from URL…", expanded=True) as s:
+        with requests.get(url, stream=True, timeout=600) as r:
+            r.raise_for_status()
+
+            # Try to learn the filename/extension
+            cd = r.headers.get("content-disposition", "")
+            fname = None
+            m = re.search(r'filename="?([^"]+)"?', cd, flags=re.I)
+            if m:
+                fname = m.group(1)
+            if not fname:
+                # fallback: last path segment
+                fname = url.split("?")[0].rstrip("/").split("/")[-1] or "download.bin"
+
+            # decide temp path to save the raw bytes
+            raw_path = f"{base_path_no_ext}__raw"
+            with open(raw_path, "wb") as f:
+                total = int(r.headers.get("content-length", 0))
+                done = 0
+                prog = st.progress(0.0)
+                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            prog.progress(min(done / total, 1.0))
+                prog.empty()
+        s.update(label="Download complete", state="complete")
+
+    # Decide how to turn it into a CSV
+    fname_lower = fname.lower()
+    csv_path = f"{base_path_no_ext}.csv"
+
+    try:
+        if fname_lower.endswith(".gz"):
+            with gzip.open(raw_path, "rb") as src, open(csv_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        elif fname_lower.endswith(".zip"):
+            with zipfile.ZipFile(raw_path) as z:
+                # pick first CSV inside
+                names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+                if not names:
+                    raise RuntimeError("ZIP file has no CSV inside.")
+                with z.open(names[0]) as src, open(csv_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        else:
+            # assume it's already CSV
+            shutil.move(raw_path, csv_path)
+            raw_path = None
+    finally:
+        # cleanup tmp
+        try:
+            if os.path.exists(raw_path):
+                os.remove(raw_path)
+        except Exception:
+            pass
+
+    return csv_path
 
 # ===============================
 # ---- 2) DATA LAYER / CACHE ----
@@ -986,6 +1077,7 @@ st.write("Sube un CSV sin procesar → se **procesará** y se **fusionará** con
 
 uploaded = st.file_uploader("Subir CSV (exportación BDS sin procesar)", type=["csv"])
 
+# >>> DEFINE PERFORMANCE CONTROLS *BEFORE* ANY HANDLERS USE THEM  <<<
 fast_mode = st.toggle(
     "🚀 Carga rápida (omite resumen de recurrencia ahora)",
     value=True,
@@ -998,6 +1090,47 @@ chunksize_opt = st.select_slider(
     format_func=lambda x: f"{x:,} filas",
 )
 
+# ---- URL ingestion (bypasses 200MB uploader limit) ----
+st.markdown("**Or paste a link (Dropbox / Google Drive / S3 / HTTPS):**")
+url_in = st.text_input("URL to a CSV (or .gz/.zip with a CSV inside)", placeholder="https://…")
+fetch_btn = st.button("Fetch & Merge from URL", use_container_width=True, disabled=not url_in)
+
+if fetch_btn and url_in:
+    before_rows = len(_read_master())
+    with st.status("Downloading and processing…", expanded=True) as status:
+        ts_tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_no_ext = os.path.join(DATA_DIR, f"remote_{ts_tag}")
+        csv_local_path = download_url_to_csv(url_in, base_no_ext)
+        st.write(f"Saved to: `{csv_local_path}`")
+
+        processed_path = os.path.join(PROCESSED_DIR, f"processed_{ts_tag}.csv")
+        st.write("Reading & enriching CSV…")
+        result = process_log_csv_with_progress(
+            csv_local_path,
+            processed_path,
+            chunksize=chunksize_opt,
+            fast_mode=fast_mode,
+        )
+        st.write(f"Rows enriched (RAW): **{result['rows']:,}**")
+
+        st.write("Merging into master…")
+        master = _update_master_with_processed(result)
+        after_rows = len(master)
+        status.update(label="Done ✅", state="complete")
+
+    st.metric("Rows in master", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
+    st.download_button(
+        "⬇️ Download processed CSV",
+        data=open(processed_path, "rb").read(),
+        file_name=os.path.basename(processed_path),
+        mime="text/csv",
+    )
+    st.session_state["_refresh_after_merge"] = True
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.rerun()
+
+# ---- File upload path (subject to 200MB Streamlit limit) ----
 colA, colB = st.columns([1, 1])
 with colA:
     default_outname = dt.datetime.now().strftime("processed_%Y%m%d_%H%M%S.csv")
@@ -1007,7 +1140,6 @@ with colB:
 
 if process_btn and uploaded is not None:
     before_rows = len(_read_master())
-
     with st.status("Procesando archivo…", expanded=True) as status:
         raw_path = os.path.join(DATA_DIR, f"upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         uploaded.seek(0)
@@ -1023,24 +1155,22 @@ if process_btn and uploaded is not None:
         st.write("Fusionando con el conjunto maestro…")
         master = _update_master_with_processed(result)
         after_rows = len(master)
-
         status.update(label="Procesamiento completado ✅", state="complete")
 
     st.metric("Filas en master", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
-
     st.download_button(
         "⬇️ Descargar CSV procesado",
         data=open(processed_path, "rb").read(),
         file_name=os.path.basename(processed_path),
         mime="text/csv",
     )
-
     st.session_state["_refresh_after_merge"] = True
     st.cache_data.clear()
     st.cache_resource.clear()
     st.rerun()
 
 st.divider()
+
 
 # -----------------------
 # 1.5) (Optional) Pretrain all models

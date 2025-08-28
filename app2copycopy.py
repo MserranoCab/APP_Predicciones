@@ -685,12 +685,13 @@ def _dedupe_master(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _dedupe_events_by_signature_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop dupes by time+signature without sorting (much lighter for millions of rows)."""
     if df.empty:
         return df
     key = [c for c in ["Attack Start Time", "attack_signature"] if c in df.columns]
     if not key:
         return df
-    return df.sort_values("Attack Start Time").drop_duplicates(subset=key, keep="first")
+    return df.drop_duplicates(subset=key, keep="first")
 
 def _quick_row_count(parquet_dir: str) -> int:
     """Sum num_rows from parquet file footers without loading tables."""
@@ -760,6 +761,33 @@ def _session_master_download_paths() -> tuple[str, str]:
         pq.write_table(pa.Table.from_pandas(df, preserve_index=False), parquet_path, compression="zstd")
         df.to_csv(csv_path, index=False)
     return parquet_path, csv_path
+THIN_COLS = [
+    "Attack Start Time",
+    "Threat Type",
+    "Severity",
+    "attack_result_label",
+    "direction",
+    "duration",
+    "attack_signature",
+]
+
+def _load_thin_parquet(parquet_path: str) -> pd.DataFrame:
+    """Load only the minimal columns we need, and compress memory with categories."""
+    pf = pq.ParquetFile(parquet_path)
+    available = set(pf.schema.names)
+    cols = [c for c in THIN_COLS if c in available]
+    table = pf.read(columns=cols)
+    df = table.to_pandas()
+    # enforce dtypes
+    if "Attack Start Time" in df.columns:
+        df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+    for c in ["Threat Type", "Severity", "attack_result_label", "direction"]:
+        if c in df.columns:
+            try:
+                df[c] = df[c].astype("category")
+            except Exception:
+                pass
+    return df
 
 # -------------------------------
 # Seed/Bootstrap on first run
@@ -1233,11 +1261,12 @@ if fetch_btn and url_in:
         st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
 
         try:
-            curr = pq.read_table(result["parquet_path"]).to_pandas()
+            curr = _load_thin_parquet(result["parquet_path"])
         except MemoryError:
             st.error("⚠️ The enriched parquet is too large to load into memory right now.")
             st.info("Tips: lower chunksize, keep 🚀 Fast mode on, or split the file.")
             curr = pd.DataFrame()
+
 
         master = _append_session_master(curr)
         after_rows = len(master)

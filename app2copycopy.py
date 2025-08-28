@@ -416,10 +416,9 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
   # --- stream the CSV in chunks ---
     for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
         try:
-            # 1) NEW: normalize headers on every chunk (prevents Arrow duplicate-name errors)
+            # Normalize headers to avoid duplicate-name crashes in Arrow
             df = _normalize_and_uniquify_columns(df)
     
-            # 2) your existing guards for required columns
             if "Addition Info" not in df.columns:
                 df["Addition Info"] = np.nan
             if "attack_result" not in df.columns:
@@ -430,7 +429,6 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 else:
                     raise ValueError("CSV must include 'Attack Start Time' column.")
     
-            # 3) your enrichment steps
             df = _vectorized_parse(df)
             df = map_attack_result(df)
             df = create_attack_signature(df)
@@ -440,7 +438,6 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
             df["Day"] = ts.dt.date
             df["Hour"] = ts.dt.hour
     
-            # 4) stabilize text-ish columns for Arrow
             TEXTY_COLS = [
                 "Addition Info", "Threat Name", "Threat Type", "Threat Subtype",
                 "Source IP", "Destination IP", "Attacker", "Victim",
@@ -450,7 +447,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 if c in df.columns:
                     df[c] = df[c].astype("string")
     
-            # 5) keep schema stable across chunks
+            # stabilize schema across chunks
             if cols_ref is None:
                 cols_ref = list(df.columns)
             else:
@@ -459,7 +456,6 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                         df[c] = pd.NA
                 df = df.reindex(columns=cols_ref)
     
-            # 6) write parquet (with first-chunk schema)
             table = pa.Table.from_pandas(df, preserve_index=False)
     
             if writer is None:
@@ -474,11 +470,18 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
             prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
     
         except Exception as e:
-            # Show chunk index + traceback so you can fix fast
             st.error(f"❌ Error while processing chunk {i:,}: {e}")
             st.exception(e)
+            # Stop so you can see the real error
+            if writer is not None:
+                try: writer.close()
+                except Exception: pass
             raise
-
+    
+    # close writer at the end
+    if writer is not None:
+        writer.close()
+    
     if fast_mode:
         pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
     else:
@@ -486,9 +489,10 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         df_final = calculate_recurrence(df_all)
         df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]], on="attack_signature", how="left")
         df_final.to_csv(output_path, index=False)
-
+    
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
     return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
+
 
 # ---------- URL ingest helpers ----------
 def _normalize_direct_download(url: str) -> str:
@@ -1147,6 +1151,8 @@ def pretrain_models(master_df: pd.DataFrame):
 # ---- 4) STREAMLIT UI  -----
 # ===========================
 st.title("🛡️ Predicción de Ataques")
+
+
 # Make the mode super clear to the user
 st.info("**Session-only mode:** your data is kept in memory during this run. "
         "Download your dataset before closing the app.")
@@ -1185,12 +1191,12 @@ if "seed_done" not in st.session_state:
 # Sidebar: data status (supports stateless mode)
 with st.sidebar:
     st.header("📦 Data Status")
-
-    # Session-only dataset (no persistence)
     st.caption("Session master: in-memory only (not persisted)")
-    master = st.session_state.get("session_master_df", pd.DataFrame())
 
+    # Always read the current session dataset
+    master = st.session_state.get("session_master_df", pd.DataFrame())
     cov = _coverage_stats(master)
+
     if cov:
         start, end, n = cov
         st.success(f"Data from **{start}** to **{end}**  \nRows: **{n:,}**")
@@ -1255,16 +1261,18 @@ url_in = st.text_input("URL to a CSV (or .gz/.zip with a CSV inside)", placehold
 fetch_btn = st.button("Fetch & Merge from URL", use_container_width=True, disabled=not url_in)
 
 if fetch_btn and url_in:
-    # use the already-defined `master` from the sidebar block
-    before_rows = len(master) if isinstance(master, pd.DataFrame) else 0
+    # Always compute before_rows from the session dataset (not from a sidebar var)
+    before_rows = len(st.session_state.get("session_master_df", pd.DataFrame()))
 
     with st.status("Downloading and processing…", expanded=True) as status:
         ts_tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_no_ext = os.path.join(DATA_DIR, f"remote_{ts_tag}")
+
+        # Download (your robust function here is fine; keep your version)
         csv_local_path = download_url_to_csv(url_in, base_no_ext)
         st.write(f"Saved to: `{csv_local_path}`")
-        
-        # Show a small preview to catch HTML/garbage early
+
+        # Optional: preview to catch HTML/garbage early
         st.write("Preview of downloaded file (first ~1KB):")
         with open(csv_local_path, "rb") as fh:
             preview = fh.read(1024).decode(errors="ignore")
@@ -1279,15 +1287,31 @@ if fetch_btn and url_in:
             fast_mode=fast_mode,
         )
         st.write(f"Rows enriched (RAW): **{result['rows']:,}**")
-        st.write("Merging into session dataset…")
-        curr = pq.read_table(result["parquet_path"]).to_pandas()
+
+        # FIRST vs MERGE messaging
+        is_first = st.session_state.get("session_master_df", pd.DataFrame()).empty
+        st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
+
+        try:
+            curr = pq.read_table(result["parquet_path"]).to_pandas()
+        except MemoryError:
+            st.error("⚠️ The enriched parquet is too large to load into memory right now.")
+            st.info("Tips: lower chunksize, keep 🚀 Fast mode on, or split the file.")
+            curr = pd.DataFrame()
+
         master = _append_session_master(curr)
         after_rows = len(master)
-        status.update(label="Done ✅ (session only; nothing persisted)", state="complete")
-        
-        st.metric("Rows in session dataset", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
 
-    st.metric("Rows in master", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
+        status.update(
+            label=("First dataset loaded ✅ (session only; nothing persisted)"
+                   if is_first else
+                   "Merge complete ✅ (session only; nothing persisted)"),
+            state="complete"
+        )
+
+    st.metric("Rows in session dataset", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
+
+    # Download processed result + current session dataset
     st.download_button(
         "⬇️ Download processed CSV",
         data=open(processed_path, "rb").read(),
@@ -1295,28 +1319,28 @@ if fetch_btn and url_in:
         mime="text/csv",
     )
 
-    # extra downloads when in stateless mode
-    if stateless and after_rows > 0:
-        p_parq, p_csv = _session_master_download_paths()
-        if os.path.exists(p_parq):
-            st.download_button(
-                "⬇️ Download merged (session) parquet",
-                data=open(p_parq, "rb").read(),
-                file_name="session_master.parquet",
-                mime="application/octet-stream",
-            )
-        if os.path.exists(p_csv):
-            st.download_button(
-                "⬇️ Download merged (session) CSV",
-                data=open(p_csv, "rb").read(),
-                file_name="session_master.csv",
-                mime="text/csv",
-            )
+    p_parq, p_csv = _session_master_download_paths()
+    if os.path.exists(p_parq):
+        st.download_button(
+            "⬇️ Download merged (session) parquet",
+            data=open(p_parq, "rb").read(),
+            file_name="session_master.parquet",
+            mime="application/octet-stream",
+        )
+    if os.path.exists(p_csv):
+        st.download_button(
+            "⬇️ Download merged (session) CSV",
+            data=open(p_csv, "rb").read(),
+            file_name="session_master.csv",
+            mime="text/csv",
+        )
 
+    # Refresh
     st.session_state["_refresh_after_merge"] = True
     st.cache_data.clear()
     st.cache_resource.clear()
     st.rerun()
+
 
 
 
@@ -1329,7 +1353,7 @@ with colB:
     process_btn = st.button("Process & Merge", type="primary", use_container_width=True, disabled=uploaded is None)
 
 if process_btn and uploaded is not None:
-    before_rows = len(master) if isinstance(master, pd.DataFrame) else 0
+    before_rows = len(st.session_state.get("session_master_df", pd.DataFrame()))
 
     with st.status("Procesando archivo…", expanded=True) as status:
         raw_path = os.path.join(DATA_DIR, f"upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
@@ -1348,8 +1372,10 @@ if process_btn and uploaded is not None:
         )
         st.write(f"Filas enriquecidas (RAW): **{result['rows']:,}**")
 
-        # 👇 Session-only merge (no persisted master)
-        st.write("Fusionando con el dataset de sesión…")
+        # FIRST vs MERGE messaging
+        is_first = st.session_state.get("session_master_df", pd.DataFrame()).empty
+        st.write("Iniciando dataset de sesión…" if is_first else "Fusionando con el dataset de sesión…")
+
         try:
             curr = pq.read_table(result["parquet_path"]).to_pandas()
         except MemoryError:
@@ -1359,12 +1385,16 @@ if process_btn and uploaded is not None:
 
         master = _append_session_master(curr)
         after_rows = len(master)
-        status.update(label="Procesamiento completado ✅ (solo sesión; nada persistido)", state="complete")
 
-    # ✅ Session dataset metric
+        status.update(
+            label=("Primer dataset cargado ✅ (solo sesión; nada persistido)"
+                   if is_first else
+                   "Fusión completada ✅ (solo sesión; nada persistido)"),
+            state="complete"
+        )
+
     st.metric("Filas en dataset de sesión", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
 
-    # Descarga del CSV procesado
     st.download_button(
         "⬇️ Descargar CSV procesado",
         data=open(processed_path, "rb").read(),
@@ -1372,7 +1402,6 @@ if process_btn and uploaded is not None:
         mime="text/csv",
     )
 
-    # Descargas del dataset de sesión (parquet / csv)
     p_parq, p_csv = _session_master_download_paths()
     if os.path.exists(p_parq):
         st.download_button(
@@ -1389,7 +1418,6 @@ if process_btn and uploaded is not None:
             mime="text/csv",
         )
 
-    # Refrescar estado/cachés
     st.session_state["_refresh_after_merge"] = True
     st.cache_data.clear()
     st.cache_resource.clear()

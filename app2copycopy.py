@@ -685,13 +685,16 @@ def _dedupe_master(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _dedupe_events_by_signature_time(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop dupes by time+signature without sorting (much lighter for millions of rows)."""
+    """Drop dupes only when we have BOTH time and signature; otherwise, don't risk over-collapsing."""
     if df.empty:
         return df
-    key = [c for c in ["Attack Start Time", "attack_signature"] if c in df.columns]
-    if not key:
-        return df
-    return df.drop_duplicates(subset=key, keep="first")
+    if "Attack Start Time" in df.columns and "attack_signature" in df.columns:
+        # no sort -> lighter on memory
+        return df.drop_duplicates(subset=["Attack Start Time", "attack_signature"], keep="first")
+    # If we lack the signature, skip de-dup here (better to keep rows than to lose them)
+    st.caption("Skipping aggressive de-dup because 'attack_signature' not present in the loaded frame.")
+    return df
+
 
 def _quick_row_count(parquet_dir: str) -> int:
     """Sum num_rows from parquet file footers without loading tables."""
@@ -763,32 +766,71 @@ def _session_master_download_paths() -> tuple[str, str]:
     return parquet_path, csv_path
 THIN_COLS = [
     "Attack Start Time",
+    "attack_signature",
+    "Threat Name",
     "Threat Type",
+    "Threat Subtype",
     "Severity",
+    "Source IP",
+    "Destination IP",
+    "Attacker",
+    "Victim",
+    # (optional extra features used later)
     "attack_result_label",
     "direction",
     "duration",
-    "attack_signature",
 ]
 
 def _load_thin_parquet(parquet_path: str) -> pd.DataFrame:
-    """Load only the minimal columns we need, and compress memory with categories."""
+    """Load a thin slice of the parquet and ensure we have 'attack_signature'.
+    Falls back to rebuilding it if missing, and uses categories to minimize RAM."""
     pf = pq.ParquetFile(parquet_path)
     available = set(pf.schema.names)
     cols = [c for c in THIN_COLS if c in available]
     table = pf.read(columns=cols)
     df = table.to_pandas()
-    # enforce dtypes
+
+    # Normalize time
     if "Attack Start Time" in df.columns:
         df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
-    for c in ["Threat Type", "Severity", "attack_result_label", "direction"]:
+
+    # If signature is missing, rebuild it from available parts
+    if "attack_signature" not in df.columns:
+        parts = [
+            ("Threat Name", ""),
+            ("Threat Type", ""),
+            ("Threat Subtype", ""),
+            ("Severity", ""),
+            ("Source IP", ""),
+            ("Destination IP", ""),
+            ("Attacker", ""),
+            ("Victim", ""),
+        ]
+        have_any = any(col in df.columns for col, _ in parts)
+        if have_any:
+            for col, _ in parts:
+                if col not in df.columns:
+                    df[col] = np.nan
+            df["attack_signature"] = df[[p[0] for p in parts]].astype(str).agg("|".join, axis=1)
+        else:
+            # last resort: make a weak signature that won't over-dedupe
+            df["attack_signature"] = (
+                df.get("Threat Type", pd.Series(["?"] * len(df))).astype(str)
+                + "|" + df.get("Severity", pd.Series(["?"] * len(df))).astype(str)
+                + "|" + df.index.astype(str)
+            )
+            st.warning("attack_signature missing: rebuilt a weak signature to avoid over-dedupe.")
+
+    # Compress memory
+    for c in ["Threat Name","Threat Type","Threat Subtype","Severity","Source IP",
+              "Destination IP","Attacker","Victim","attack_result_label","direction"]:
         if c in df.columns:
             try:
                 df[c] = df[c].astype("category")
             except Exception:
                 pass
-    return df
 
+    return df
 # -------------------------------
 # Seed/Bootstrap on first run
 # -------------------------------
@@ -1267,8 +1309,14 @@ if fetch_btn and url_in:
             st.info("Tips: lower chunksize, keep 🚀 Fast mode on, or split the file.")
             curr = pd.DataFrame()
 
-
+        # >>> DEBUG: verify what's loaded
+        st.write("Loaded columns:", list(curr.columns))
+        st.write("Shape after thin load:", curr.shape)
+        st.write("Sample:", curr.head(2))
+        # <<< DEBUG
+        
         master = _append_session_master(curr)
+
         after_rows = len(master)
 
         status.update(
@@ -1337,12 +1385,16 @@ if process_btn and uploaded is not None:
         st.write("Iniciando dataset de sesión…" if is_first else "Fusionando con el dataset de sesión…")
 
         try:
-            curr = pq.read_table(result["parquet_path"]).to_pandas()
+            curr = _load_thin_parquet(result["parquet_path"])
         except MemoryError:
             st.error("⚠️ El parquet enriquecido es demasiado grande para cargarlo en memoria ahora.")
             st.info("Sugerencias: baja el 'chunksize', deja '🚀 Carga rápida' activado, o procesa en partes.")
             curr = pd.DataFrame()
 
+       # >>> DEBUG: verify what's loaded
+        st.write("Loaded columns:", list(curr.columns))
+        st.write("Shape after thin load:", curr.shape)
+        st.write("Sample:", curr.head(2))
         master = _append_session_master(curr)
         after_rows = len(master)
 

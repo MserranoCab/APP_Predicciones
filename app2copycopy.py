@@ -649,6 +649,29 @@ def _coverage_stats(df: pd.DataFrame):
         return None
     return ts.min(), ts.max(), len(df)
 
+# ------- Stateless (no-master) helpers -------
+def _append_session_master(new_df: pd.DataFrame) -> pd.DataFrame:
+    """Append new_df to a session-only master and de-duplicate by time+signature when possible."""
+    base = st.session_state.get("session_master_df")
+    if base is None or base.empty:
+        st.session_state["session_master_df"] = _dedupe_events_by_signature_time(new_df)
+    else:
+        merged = pd.concat([base, new_df], ignore_index=True)
+        st.session_state["session_master_df"] = _dedupe_events_by_signature_time(merged)
+    return st.session_state["session_master_df"]
+
+def _session_master_df() -> pd.DataFrame:
+    return st.session_state.get("session_master_df", pd.DataFrame())
+
+def _session_master_download_paths() -> tuple[str, str]:
+    """Write the current session master to parquet & csv so user can download."""
+    df = _session_master_df().copy()
+    parquet_path = os.path.join(DATA_DIR, "session_master.parquet")
+    csv_path = os.path.join(DATA_DIR, "session_master.csv")
+    if not df.empty:
+        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), parquet_path, compression="zstd")
+        df.to_csv(csv_path, index=False)
+    return parquet_path, csv_path
 
 # -------------------------------
 # Seed/Bootstrap on first run
@@ -1058,18 +1081,28 @@ if "seed_done" not in st.session_state:
             s.update(label="Initialization failed", state="error")
             st.error(f"Bootstrap failed: {e}")
 
-# Sidebar: data status
+# Sidebar: data status (supports stateless mode)
 with st.sidebar:
     st.header("📦 Data Status")
-    st.caption(f"Master parts found: {len(glob.glob(os.path.join(MASTER_DS_DIR, '*.parquet')))}")
 
-    master = read_master_cached()
-    cov = _coverage_stats(master)
+    stateless = st.toggle(
+        "No master (session only)",
+        value=True,
+        help="Use only the current upload(s) in this session. Nothing is stored as a server-side master."
+    )
+
+    if stateless:
+        master = _session_master_df()
+        cov = _coverage_stats(master)
+        st.caption("Session master: in-memory only")
+    else:
+        st.caption(f"Master parts found: {len(glob.glob(os.path.join(MASTER_DS_DIR, '*.parquet')))}")
+        master = read_master_cached()
+        cov = _coverage_stats(master)
 
     if cov:
         start, end, n = cov
         st.success(f"Data from **{start}** to **{end}**  \nRows: **{n:,}**")
-
         if not master.empty and "Threat Type" in master.columns:
             tt_list = sorted(map(str, master["Threat Type"].dropna().unique()))
         else:
@@ -1077,30 +1110,39 @@ with st.sidebar:
         st.write(f"Threat Types ({len(tt_list)}):")
         st.write(", ".join(tt_list[:30]) + (" ..." if len(tt_list) > 30 else ""))
 
-        try:
-            snapshot_path = os.path.join(DATA_DIR, "master_snapshot.parquet")
-            pq.write_table(pa.Table.from_pandas(master, preserve_index=False), snapshot_path, compression="zstd")
-            st.download_button(
-                "⬇️ Download master.parquet",
-                data=open(snapshot_path, "rb").read(),
-                file_name="master.parquet",
-                mime="application/octet-stream",
-            )
-        except Exception as e:
-            st.warning(f"Could not create Parquet snapshot: {e}")
-
-        if os.path.exists(MASTER_CSV):
+        # Downloads
+        if stateless:
+            p_parq, p_csv = _session_master_download_paths()
+            if os.path.exists(p_parq):
+                st.download_button("⬇️ Download session master.parquet", data=open(p_parq, "rb").read(),
+                                   file_name="session_master.parquet", mime="application/octet-stream")
+            if os.path.exists(p_csv):
+                st.download_button("⬇️ Download session master.csv", data=open(p_csv, "rb").read(),
+                                   file_name="session_master.csv", mime="text/csv")
+        else:
             try:
+                snapshot_path = os.path.join(DATA_DIR, "master_snapshot.parquet")
+                pq.write_table(pa.Table.from_pandas(master, preserve_index=False), snapshot_path, compression="zstd")
                 st.download_button(
-                    "⬇️ Download legacy master.csv",
-                    data=open(MASTER_CSV, "rb").read(),
-                    file_name="master.csv",
-                    mime="text/csv",
+                    "⬇️ Download master.parquet",
+                    data=open(snapshot_path, "rb").read(),
+                    file_name="master.parquet",
+                    mime="application/octet-stream",
                 )
             except Exception as e:
-                st.warning(f"Could not read legacy master.csv: {e}")
+                st.warning(f"Could not create Parquet snapshot: {e}")
+            if os.path.exists(MASTER_CSV):
+                try:
+                    st.download_button(
+                        "⬇️ Download legacy master.csv",
+                        data=open(MASTER_CSV, "rb").read(),
+                        file_name="master.csv",
+                        mime="text/csv",
+                    )
+                except Exception as e:
+                    st.warning(f"Could not read legacy master.csv: {e}")
     else:
-        st.info("No data yet. Upload a CSV to get started.\nTip: put baseline CSVs in seeds/ or set CYBER_SEED_CSVS.")
+        st.info("No data yet. Upload a CSV to get started.")
 
     st.markdown("---")
     if st.button("↻ Clear caches"):
@@ -1136,7 +1178,8 @@ url_in = st.text_input("URL to a CSV (or .gz/.zip with a CSV inside)", placehold
 fetch_btn = st.button("Fetch & Merge from URL", use_container_width=True, disabled=not url_in)
 
 if fetch_btn and url_in:
-    before_rows = len(_read_master())
+    # use the already-defined `master` from the sidebar block
+    before_rows = len(master) if isinstance(master, pd.DataFrame) else 0
 
     with st.status("Downloading and processing…", expanded=True) as status:
         ts_tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1153,14 +1196,19 @@ if fetch_btn and url_in:
             fast_mode=fast_mode,
         )
         st.write(f"Rows enriched (RAW): **{result['rows']:,}**")
-
         st.write("Merging into master…")
-        master = _update_master_with_processed(result)
 
-        # Prefer a real length if we have a DF, otherwise footer-based count
-        after_rows = len(master) if not master.empty else _quick_row_count(MASTER_DS_DIR)
-
-        status.update(label="Done ✅", state="complete")
+        if stateless:
+            # keep the new data only in session memory
+            curr = pq.read_table(result["parquet_path"]).to_pandas()
+            master = _append_session_master(curr)
+            after_rows = len(master)
+            status.update(label="Done ✅ (session only; nothing persisted)", state="complete")
+        else:
+            # persisted master mode (old behavior)
+            master = _update_master_with_processed(result)
+            after_rows = len(master) if (isinstance(master, pd.DataFrame) and not master.empty) else _quick_row_count(MASTER_DS_DIR)
+            status.update(label="Done ✅", state="complete")
 
     st.metric("Rows in master", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
     st.download_button(
@@ -1170,10 +1218,29 @@ if fetch_btn and url_in:
         mime="text/csv",
     )
 
+    # extra downloads when in stateless mode
+    if stateless and after_rows > 0:
+        p_parq, p_csv = _session_master_download_paths()
+        if os.path.exists(p_parq):
+            st.download_button(
+                "⬇️ Download merged (session) parquet",
+                data=open(p_parq, "rb").read(),
+                file_name="session_master.parquet",
+                mime="application/octet-stream",
+            )
+        if os.path.exists(p_csv):
+            st.download_button(
+                "⬇️ Download merged (session) CSV",
+                data=open(p_csv, "rb").read(),
+                file_name="session_master.csv",
+                mime="text/csv",
+            )
+
     st.session_state["_refresh_after_merge"] = True
     st.cache_data.clear()
     st.cache_resource.clear()
     st.rerun()
+
 
 
 # ---- File upload path (subject to 200MB Streamlit limit) ----
@@ -1185,7 +1252,8 @@ with colB:
     process_btn = st.button("Process & Merge", type="primary", use_container_width=True, disabled=uploaded is None)
 
 if process_btn and uploaded is not None:
-    before_rows = len(_read_master())
+    before_rows = len(master) if isinstance(master, pd.DataFrame) else 0
+
     with st.status("Procesando archivo…", expanded=True) as status:
         raw_path = os.path.join(DATA_DIR, f"upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         uploaded.seek(0)
@@ -1195,14 +1263,24 @@ if process_btn and uploaded is not None:
 
         processed_path = os.path.join(PROCESSED_DIR, outname)
         st.write("Leyendo y enriqueciendo CSV…")
-        result = process_log_csv_with_progress(raw_path, processed_path, chunksize=chunksize_opt, fast_mode=fast_mode)
+        result = process_log_csv_with_progress(
+            raw_path,
+            processed_path,
+            chunksize=chunksize_opt,
+            fast_mode=fast_mode
+        )
         st.write(f"Filas enriquecidas (RAW): **{result['rows']:,}**")
-
         st.write("Fusionando con el conjunto maestro…")
-        master = _update_master_with_processed(result)
-        after_rows = len(master) if not master.empty else _quick_row_count(MASTER_DS_DIR)
-        status.update(label="Procesamiento completado ✅", state="complete")
 
+        if stateless:
+            curr = pq.read_table(result["parquet_path"]).to_pandas()
+            master = _append_session_master(curr)
+            after_rows = len(master)
+            status.update(label="Procesamiento completado ✅ (solo sesión)", state="complete")
+        else:
+            master = _update_master_with_processed(result)
+            after_rows = len(master) if (isinstance(master, pd.DataFrame) and not master.empty) else _quick_row_count(MASTER_DS_DIR)
+            status.update(label="Procesamiento completado ✅", state="complete")
 
     st.metric("Filas en master", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
     st.download_button(
@@ -1211,6 +1289,24 @@ if process_btn and uploaded is not None:
         file_name=os.path.basename(processed_path),
         mime="text/csv",
     )
+
+    if stateless and after_rows > 0:
+        p_parq, p_csv = _session_master_download_paths()
+        if os.path.exists(p_parq):
+            st.download_button(
+                "⬇️ Descargar combinado (sesión) parquet",
+                data=open(p_parq, "rb").read(),
+                file_name="session_master.parquet",
+                mime="application/octet-stream",
+            )
+        if os.path.exists(p_csv):
+            st.download_button(
+                "⬇️ Descargar combinado (sesión) CSV",
+                data=open(p_csv, "rb").read(),
+                file_name="session_master.csv",
+                mime="text/csv",
+            )
+
     st.session_state["_refresh_after_merge"] = True
     st.cache_data.clear()
     st.cache_resource.clear()
@@ -1222,7 +1318,6 @@ st.divider()
 # -----------------------
 # 1.5) (Optional) Pretrain all models
 # -----------------------
-master = read_master_cached()
 if not master.empty:
     c1, c2 = st.columns([1, 3])
     with c1:

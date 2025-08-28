@@ -27,7 +27,7 @@ plt.rcParams.update({"figure.autolayout": True})
 # =========================
 # ---- CONFIG / STORAGE ----
 # =========================
-STATELESS_ONLY = True
+STATELESS_ONLY = True  # in-memory dataset only (no persisted master)
 st.set_page_config(page_title="Cyber Attacks Forecaster", page_icon="🛡️", layout="wide")
 
 DATA_DIR = "data"
@@ -413,12 +413,12 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
     schema = None
     cols_ref = None
 
-  # --- stream the CSV in chunks ---
+    # --- stream the CSV in chunks ---
     for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
         try:
             # Normalize headers to avoid duplicate-name crashes in Arrow
             df = _normalize_and_uniquify_columns(df)
-    
+
             if "Addition Info" not in df.columns:
                 df["Addition Info"] = np.nan
             if "attack_result" not in df.columns:
@@ -428,16 +428,16 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                     df["Attack Start Time"] = pd.to_datetime(df["First Seen"], errors="coerce")
                 else:
                     raise ValueError("CSV must include 'Attack Start Time' column.")
-    
+
             df = _vectorized_parse(df)
             df = map_attack_result(df)
             df = create_attack_signature(df)
-    
+
             ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
             df["Attack Start Time"] = ts
             df["Day"] = ts.dt.date
             df["Hour"] = ts.dt.hour
-    
+
             TEXTY_COLS = [
                 "Addition Info", "Threat Name", "Threat Type", "Threat Subtype",
                 "Source IP", "Destination IP", "Attacker", "Victim",
@@ -446,7 +446,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
             for c in TEXTY_COLS:
                 if c in df.columns:
                     df[c] = df[c].astype("string")
-    
+
             # stabilize schema across chunks
             if cols_ref is None:
                 cols_ref = list(df.columns)
@@ -455,33 +455,35 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                     if c not in df.columns:
                         df[c] = pd.NA
                 df = df.reindex(columns=cols_ref)
-    
+
             table = pa.Table.from_pandas(df, preserve_index=False)
-    
+
             if writer is None:
                 schema = table.schema
                 writer = pq.ParquetWriter(out_parquet, schema=schema, compression="zstd", use_dictionary=True)
             else:
                 table = table.cast(schema)
-    
+
             writer.write_table(table)
-    
+
             rows_done += len(df)
             prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
-    
+
         except Exception as e:
             st.error(f"❌ Error while processing chunk {i:,}: {e}")
             st.exception(e)
             # Stop so you can see the real error
             if writer is not None:
-                try: writer.close()
-                except Exception: pass
+                try:
+                    writer.close()
+                except Exception:
+                    pass
             raise
-    
+
     # close writer at the end
     if writer is not None:
         writer.close()
-    
+
     if fast_mode:
         pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
     else:
@@ -489,7 +491,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         df_final = calculate_recurrence(df_all)
         df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]], on="attack_signature", how="left")
         df_final.to_csv(output_path, index=False)
-    
+
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
     return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
 
@@ -1152,12 +1154,11 @@ def pretrain_models(master_df: pd.DataFrame):
 # ===========================
 st.title("🛡️ Predicción de Ataques")
 
+# Modo sesión: aclaración al usuario
+st.info("**Modo solo sesión:** los datos se mantienen en memoria durante esta ejecución. "
+        "Descarga tu dataset antes de cerrar la app.")
 
-# Make the mode super clear to the user
-st.info("**Session-only mode:** your data is kept in memory during this run. "
-        "Download your dataset before closing the app.")
-
-# First-run seeding with visible status — disabled when session-only
+# Semilla/Bootstrap DESHABILITADO cuando es solo sesión
 if not STATELESS_ONLY:
     if "seed_done" not in st.session_state:
         with st.status("Initializing data (first run only)…", expanded=True) as s:
@@ -1174,71 +1175,11 @@ if not STATELESS_ONLY:
 
 st.caption("Subir Información → Procesar → Entrenar → Predecir")
 
-# First-run seeding with visible status (prevents blank screen)
-if "seed_done" not in st.session_state:
-    with st.status("Initializing data (first run only)…", expanded=True) as s:
-        try:
-            if not SKIP_BOOTSTRAP:
-                ensure_secret_seed_download()
-                _bootstrap_seed_data()
-            st.session_state["seed_done"] = True
-            s.update(label="Initialization complete", state="complete")
-            _bust_caches_and_rerun()
-        except Exception as e:
-            s.update(label="Initialization failed", state="error")
-            st.error(f"Bootstrap failed: {e}")
-
-# Sidebar: data status (supports stateless mode)
-with st.sidebar:
-    st.header("📦 Data Status")
-    st.caption("Session master: in-memory only (not persisted)")
-
-    # Always read the current session dataset
-    master = st.session_state.get("session_master_df", pd.DataFrame())
-    cov = _coverage_stats(master)
-
-    if cov:
-        start, end, n = cov
-        st.success(f"Data from **{start}** to **{end}**  \nRows: **{n:,}**")
-        if not master.empty and "Threat Type" in master.columns:
-            tt_list = sorted(map(str, master["Threat Type"].dropna().unique()))
-        else:
-            tt_list = []
-        st.write(f"Threat Types ({len(tt_list)}):")
-        st.write(", ".join(tt_list[:30]) + (" ..." if len(tt_list) > 30 else ""))
-
-        # Downloads of the current session dataset
-        p_parq, p_csv = _session_master_download_paths()
-        if os.path.exists(p_parq):
-            st.download_button(
-                "⬇️ Download session master.parquet",
-                data=open(p_parq, "rb").read(),
-                file_name="session_master.parquet",
-                mime="application/octet-stream"
-            )
-        if os.path.exists(p_csv):
-            st.download_button(
-                "⬇️ Download session master.csv",
-                data=open(p_csv, "rb").read(),
-                file_name="session_master.csv",
-                mime="text/csv"
-            )
-    else:
-        st.info("No data yet. Upload or fetch to get started.")
-
-    st.markdown("---")
-    if st.button("↻ Clear caches"):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.success("Caches cleared. Reloading…")
-        st.experimental_rerun()
-
-
 # -----------------------
 # 1) Upload & Processing
 # -----------------------
 st.subheader("1) Agrega Información para Entrenar el Modelo")
-st.write("Sube un CSV sin procesar → se **procesará** y se **fusionará** con el conjunto de datos maestro.")
+st.write("Sube un CSV sin procesar → se **procesará** y se **agregará** al **dataset de sesión** (no persistido).")
 
 uploaded = st.file_uploader("Subir CSV (exportación BDS sin procesar)", type=["csv"])
 
@@ -1256,19 +1197,18 @@ chunksize_opt = st.select_slider(
 )
 
 # ---- URL ingestion (bypasses 200MB uploader limit) ----
-st.markdown("**Or paste a link (Dropbox / Google Drive / S3 / HTTPS):**")
-url_in = st.text_input("URL to a CSV (or .gz/.zip with a CSV inside)", placeholder="https://…")
+st.markdown("**O pega un enlace (Dropbox / Google Drive / S3 / HTTPS):**")
+url_in = st.text_input("URL a un CSV (o .gz/.zip con un CSV dentro)", placeholder="https://…")
 fetch_btn = st.button("Fetch & Merge from URL", use_container_width=True, disabled=not url_in)
 
 if fetch_btn and url_in:
-    # Always compute before_rows from the session dataset (not from a sidebar var)
+    # Always compute before_rows from the session dataset
     before_rows = len(st.session_state.get("session_master_df", pd.DataFrame()))
 
     with st.status("Downloading and processing…", expanded=True) as status:
         ts_tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_no_ext = os.path.join(DATA_DIR, f"remote_{ts_tag}")
 
-        # Download (your robust function here is fine; keep your version)
         csv_local_path = download_url_to_csv(url_in, base_no_ext)
         st.write(f"Saved to: `{csv_local_path}`")
 
@@ -1334,15 +1274,6 @@ if fetch_btn and url_in:
             file_name="session_master.csv",
             mime="text/csv",
         )
-
-    # Refresh
-    st.session_state["_refresh_after_merge"] = True
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.rerun()
-
-
-
 
 # ---- File upload path (subject to 200MB Streamlit limit) ----
 colA, colB = st.columns([1, 1])
@@ -1418,17 +1349,12 @@ if process_btn and uploaded is not None:
             mime="text/csv",
         )
 
-    st.session_state["_refresh_after_merge"] = True
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.rerun()
-
 st.divider()
-
 
 # -----------------------
 # 1.5) (Optional) Pretrain all models
 # -----------------------
+master = st.session_state.get("session_master_df", pd.DataFrame())
 if not master.empty:
     c1, c2 = st.columns([1, 3])
     with c1:
@@ -1436,12 +1362,58 @@ if not master.empty:
             pretrain_models(master)
 
 # -----------------------
+# Sidebar (moved here so it reads fresh session data)
+# -----------------------
+with st.sidebar:
+    st.header("📦 Data Status")
+    st.caption("Session master: in-memory only (not persisted)")
+
+    master_side = st.session_state.get("session_master_df", pd.DataFrame())
+    cov = _coverage_stats(master_side)
+
+    if cov:
+        start, end, n = cov
+        st.success(f"Data from **{start}** to **{end}**  \nRows: **{n:,}**")
+        if not master_side.empty and "Threat Type" in master_side.columns:
+            tt_list = sorted(map(str, master_side["Threat Type"].dropna().unique()))
+        else:
+            tt_list = []
+        st.write(f"Threat Types ({len(tt_list)}):")
+        st.write(", ".join(tt_list[:30]) + (" ..." if len(tt_list) > 30 else ""))
+
+        # Downloads of the current session dataset
+        p_parq, p_csv = _session_master_download_paths()
+        if os.path.exists(p_parq):
+            st.download_button(
+                "⬇️ Download session master.parquet",
+                data=open(p_parq, "rb").read(),
+                file_name="session_master.parquet",
+                mime="application/octet-stream"
+            )
+        if os.path.exists(p_csv):
+            st.download_button(
+                "⬇️ Download session master.csv",
+                data=open(p_csv, "rb").read(),
+                file_name="session_master.csv",
+                mime="text/csv"
+            )
+    else:
+        st.info("No data yet. Upload or fetch to get started.")
+
+    st.markdown("---")
+    if st.button("↻ Clear caches"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.success("Caches cleared. Reloading…")
+        st.experimental_rerun()
+
+# -----------------------
 # 2) Training & Forecast
 # -----------------------
-master = st.session_state.get("session_master_df", pd.DataFrame())
 st.subheader("2) Entrenar el modelo y generar predicciones")
 st.write("Seleccione **Tipo(s) de amenaza**, elija **horizonte** (7/14/30 días) y cree gráficos de validación y pronóstico.")
 
+master = st.session_state.get("session_master_df", pd.DataFrame())
 if master.empty:
     st.warning("Cargue y procese al menos un CSV primero.")
 else:
@@ -1526,14 +1498,14 @@ else:
                 )
 
 st.divider()
-st.subheader("Notes & Guardrails")
+st.subheader("Notas & Guardrails")
 st.markdown(
     """
 - **Valores atípicos**: se recorta el 2% superior de los recuentos por hora.
 - **Límites de horizonte**: 7/14/30 días con comprobación de suficiencia del historial.
-- **Las funciones adicionales** (`Severity`, `attack_result_label`, `direction`, `duration`) se fusionan por hora cuando están disponibles.
-- **Persistencia**: los datos sembrados/fusionados se guardan en `data/master_parquet/` y se reutilizan en los reinicios.
-- **Bootstrapping**: se colocan los CSV de referencia en `seeds/` o se establece `CYBER_SEED_CSVS="/path/a.csv,/path/b.csv"`.
+- **Funciones adicionales** (`Severity`, `attack_result_label`, `direction`, `duration`) se fusionan por hora cuando están disponibles.
+- **Modo solo sesión**: nada se persiste a disco; descarga el **dataset de sesión** cuando quieras.
+- **(Opcional)**: si desactivas el modo solo sesión, los datos se guardan en `data/master_parquet/` y se reutilizan en reinicios.
 """
 )
 

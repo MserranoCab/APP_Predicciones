@@ -412,8 +412,13 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
     schema = None
     cols_ref = None
 
-    try:
-        for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
+  # --- stream the CSV in chunks ---
+    for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
+        try:
+            # 1) NEW: normalize headers on every chunk (prevents Arrow duplicate-name errors)
+            df = _normalize_and_uniquify_columns(df)
+    
+            # 2) your existing guards for required columns
             if "Addition Info" not in df.columns:
                 df["Addition Info"] = np.nan
             if "attack_result" not in df.columns:
@@ -423,16 +428,18 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                     df["Attack Start Time"] = pd.to_datetime(df["First Seen"], errors="coerce")
                 else:
                     raise ValueError("CSV must include 'Attack Start Time' column.")
-
+    
+            # 3) your enrichment steps
             df = _vectorized_parse(df)
             df = map_attack_result(df)
             df = create_attack_signature(df)
-
+    
             ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
             df["Attack Start Time"] = ts
             df["Day"] = ts.dt.date
             df["Hour"] = ts.dt.hour
-
+    
+            # 4) stabilize text-ish columns for Arrow
             TEXTY_COLS = [
                 "Addition Info", "Threat Name", "Threat Type", "Threat Subtype",
                 "Source IP", "Destination IP", "Attacker", "Victim",
@@ -441,7 +448,8 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
             for c in TEXTY_COLS:
                 if c in df.columns:
                     df[c] = df[c].astype("string")
-
+    
+            # 5) keep schema stable across chunks
             if cols_ref is None:
                 cols_ref = list(df.columns)
             else:
@@ -449,22 +457,26 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                     if c not in df.columns:
                         df[c] = pd.NA
                 df = df.reindex(columns=cols_ref)
-
+    
+            # 6) write parquet (with first-chunk schema)
             table = pa.Table.from_pandas(df, preserve_index=False)
-
+    
             if writer is None:
                 schema = table.schema
                 writer = pq.ParquetWriter(out_parquet, schema=schema, compression="zstd", use_dictionary=True)
             else:
                 table = table.cast(schema)
-
+    
             writer.write_table(table)
-
+    
             rows_done += len(df)
             prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
-    finally:
-        if writer is not None:
-            writer.close()
+    
+        except Exception as e:
+            # Show chunk index + traceback so you can fix fast
+            st.error(f"❌ Error while processing chunk {i:,}: {e}")
+            st.exception(e)
+            raise
 
     if fast_mode:
         pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)

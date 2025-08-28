@@ -505,69 +505,138 @@ def _normalize_direct_download(url: str) -> str:
 def download_url_to_csv(url: str, base_path_no_ext: str) -> str:
     """
     Streams a remote file to disk and returns a *CSV path*.
-    Accepts .csv, .gz, .zip (first CSV inside).
+    Accepts .csv, .gz, .zip (first CSV inside), and handles Google Drive confirm pages.
+    Robust to missing filename/extension.
     """
-    import io, gzip, zipfile
+    import io, gzip, zipfile, requests
+
+    def _looks_html(bytes_head: bytes) -> bool:
+        head = bytes_head.strip().lower()
+        return head.startswith(b'<!doctype html') or head.startswith(b'<html')
+
+    def _magic(bytes_head: bytes) -> str:
+        # return 'zip' | 'gz' | 'csv' | 'html' | 'unknown'
+        if bytes_head[:2] == b'\x1f\x8b':
+            return 'gz'
+        if bytes_head[:4] == b'PK\x03\x04':
+            return 'zip'
+        if _looks_html(bytes_head):
+            return 'html'
+        # If it contains commas and newlines early, we’ll assume csv
+        if b',' in bytes_head and b'\n' in bytes_head:
+            return 'csv'
+        return 'unknown'
+
+    def _normalize_direct_download(url: str) -> str:
+        url = url.strip()
+        # Dropbox
+        if "dropbox.com" in url:
+            if "dl=0" in url:
+                url = url.replace("dl=0", "dl=1")
+            elif "dl=1" not in url and "raw=1" not in url:
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}dl=1"
+        # Google Drive
+        m = re.search(r"drive\.google\.com/file/d/([^/]+)", url)
+        if m:
+            file_id = m.group(1)
+            url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        m = re.search(r"drive\.google\.com/open\?id=([^&]+)", url)
+        if m:
+            file_id = m.group(1)
+            url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        return url
+
+    def _maybe_handle_gdrive_confirm(session: requests.Session, url: str) -> requests.Response:
+        """
+        First request may return an HTML interstitial with a confirm token.
+        If detected, extract token and re-request the file.
+        """
+        r = session.get(url, stream=True, timeout=600)
+        r.raise_for_status()
+        # If content-type is HTML or body looks like HTML, try confirm token
+        ct = (r.headers.get("content-type") or "").lower()
+        if "text/html" in ct:
+            txt = r.text
+            m = re.search(r'confirm=([0-9A-Za-z\-_]+)', txt)
+            if m:
+                token = m.group(1)
+                # append token
+                sep = "&" if "?" in url else "?"
+                url2 = f"{url}{sep}confirm={token}"
+                r.close()
+                r = session.get(url2, stream=True, timeout=600)
+                r.raise_for_status()
+        return r
 
     url = _normalize_direct_download(url)
-    with st.status(f"Fetching from URL…", expanded=True) as s:
-        with requests.get(url, stream=True, timeout=600) as r:
-            r.raise_for_status()
+    raw_path = f"{base_path_no_ext}__raw.bin"
+    csv_path = f"{base_path_no_ext}.csv"
 
-            # Try to learn the filename/extension
-            cd = r.headers.get("content-disposition", "")
-            fname = None
-            m = re.search(r'filename="?([^"]+)"?', cd, flags=re.I)
-            if m:
-                fname = m.group(1)
-            if not fname:
-                # fallback: last path segment
-                fname = url.split("?")[0].rstrip("/").split("/")[-1] or "download.bin"
+    with st.status("Fetching from URL…", expanded=True) as s:
+        with requests.Session() as sess:
+            # Try to handle Google Drive confirm pages
+            r = _maybe_handle_gdrive_confirm(sess, url)
 
-            # decide temp path to save the raw bytes
-            raw_path = f"{base_path_no_ext}__raw"
+            # show progress
+            total = int(r.headers.get("content-length", 0))
+            done = 0
+            prog = st.progress(0.0)
             with open(raw_path, "wb") as f:
-                total = int(r.headers.get("content-length", 0))
-                done = 0
-                prog = st.progress(0.0)
                 for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
                     if chunk:
                         f.write(chunk)
                         done += len(chunk)
                         if total:
                             prog.progress(min(done / total, 1.0))
-                prog.empty()
+            prog.empty()
         s.update(label="Download complete", state="complete")
 
-    # Decide how to turn it into a CSV
-    fname_lower = fname.lower()
-    csv_path = f"{base_path_no_ext}.csv"
+    # Sniff first 4KB
+    with open(raw_path, "rb") as fh:
+        head = fh.read(4096)
+
+    kind = _magic(head)
 
     try:
-        if fname_lower.endswith(".gz"):
+        if kind == "html":
+            # Don’t attempt to parse; tell the user what happened.
+            with open(raw_path, "rb") as fh:
+                sample = fh.read(1024).decode(errors="ignore")
+            st.error(
+                "The downloaded file appears to be HTML (likely a Google Drive warning/confirm page) "
+                "instead of a CSV/ZIP/GZ. Please make the file publicly downloadable or use a direct link."
+            )
+            st.code(sample)
+            raise RuntimeError("Downloaded HTML page instead of data file.")
+
+        elif kind == "gz":
             with gzip.open(raw_path, "rb") as src, open(csv_path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
-        elif fname_lower.endswith(".zip"):
+
+        elif kind == "zip":
             with zipfile.ZipFile(raw_path) as z:
-                # pick first CSV inside
                 names = [n for n in z.namelist() if n.lower().endswith(".csv")]
                 if not names:
                     raise RuntimeError("ZIP file has no CSV inside.")
+                # pick the first CSV
                 with z.open(names[0]) as src, open(csv_path, "wb") as dst:
                     shutil.copyfileobj(src, dst)
+
         else:
-            # assume it's already CSV
+            # Treat as CSV by default (covers plain CSV and many text/csv payloads).
             shutil.move(raw_path, csv_path)
             raw_path = None
+
+        return csv_path
+
     finally:
-        # cleanup tmp
+        # Clean up temp file if still present
         try:
-            if os.path.exists(raw_path):
+            if raw_path and os.path.exists(raw_path):
                 os.remove(raw_path)
         except Exception:
             pass
-
-    return csv_path
 
 # ===============================
 # ---- 2) DATA LAYER / CACHE ----
@@ -1199,11 +1268,16 @@ if fetch_btn and url_in:
         st.write("Merging into master…")
 
         if stateless:
-            # keep the new data only in session memory
-            curr = pq.read_table(result["parquet_path"]).to_pandas()
+            try:
+                curr = pq.read_table(result["parquet_path"]).to_pandas()
+            except MemoryError:
+                st.error("⚠️ The enriched parquet is too large to load into memory right now.")
+                st.info("Tip: lower chunksize, keep 🚀 Fast mode on, or switch off stateless so it persists to disk.")
+                curr = pd.DataFrame()
             master = _append_session_master(curr)
             after_rows = len(master)
             status.update(label="Done ✅ (session only; nothing persisted)", state="complete")
+
         else:
             # persisted master mode (old behavior)
             master = _update_master_with_processed(result)
@@ -1273,10 +1347,15 @@ if process_btn and uploaded is not None:
         st.write("Fusionando con el conjunto maestro…")
 
         if stateless:
-            curr = pq.read_table(result["parquet_path"]).to_pandas()
+            try:
+                curr = pq.read_table(result["parquet_path"]).to_pandas()
+            except MemoryError:
+                st.error("⚠️ The enriched parquet is too large to load into memory right now.")
+                st.info("Tip: lower chunksize, keep 🚀 Fast mode on, or switch off stateless so it persists to disk.")
+                curr = pd.DataFrame()
             master = _append_session_master(curr)
             after_rows = len(master)
-            status.update(label="Procesamiento completado ✅ (solo sesión)", state="complete")
+            status.update(label="Done ✅ (session only; nothing persisted)", state="complete")
         else:
             master = _update_master_with_processed(result)
             after_rows = len(master) if (isinstance(master, pd.DataFrame) and not master.empty) else _quick_row_count(MASTER_DS_DIR)

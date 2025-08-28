@@ -1,4 +1,5 @@
 # app.py — Cyber Attack Forecasting Tool (Streamlit + XGBoost)
+st.set_option("client.showErrorDetails", True)
 
 import os
 import re
@@ -23,6 +24,7 @@ import pyarrow.types as patypes  # (imported for future use)
 
 warnings.filterwarnings("ignore")
 plt.rcParams.update({"figure.autolayout": True})
+st.set_option("client.showErrorDetails", True)
 
 # =========================
 # ---- CONFIG / STORAGE ----

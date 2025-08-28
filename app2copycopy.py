@@ -380,7 +380,7 @@ def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
 
 
 def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: int = 100_000, fast_mode: bool = True):
-    """Stream-read CSV in chunks → enrich → append to one parquet; write small summary."""
+    """Stream-read CSV in chunks → enrich → append to one parquet; ALSO build a tiny hourly roll-up for session use."""
     prog = st.progress(0.0, text="Leyendo CSV…")
     rows_done = 0
 
@@ -413,87 +413,118 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
     schema = None
     cols_ref = None
 
-    # --- stream the CSV in chunks ---
-    for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
-        try:
-            # Normalize headers to avoid duplicate-name crashes in Arrow
-            df = _normalize_and_uniquify_columns(df)
+    # in-memory tiny aggregator (Threat Type x hour)
+    rollup = None  # pandas DF with cols: ["Threat Type","ds","y"]
 
-            if "Addition Info" not in df.columns:
-                df["Addition Info"] = np.nan
-            if "attack_result" not in df.columns:
-                df["attack_result"] = np.nan
-            if "Attack Start Time" not in df.columns:
-                if "First Seen" in df.columns:
-                    df["Attack Start Time"] = pd.to_datetime(df["First Seen"], errors="coerce")
+    try:
+        for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
+            try:
+                # --- normalize / enrich this chunk ---
+                df = _normalize_and_uniquify_columns(df)
+
+                if "Addition Info" not in df.columns:
+                    df["Addition Info"] = np.nan
+                if "attack_result" not in df.columns:
+                    df["attack_result"] = np.nan
+                if "Attack Start Time" not in df.columns:
+                    if "First Seen" in df.columns:
+                        df["Attack Start Time"] = pd.to_datetime(df["First Seen"], errors="coerce")
+                    else:
+                        raise ValueError("CSV must include 'Attack Start Time' column.")
+
+                df = _vectorized_parse(df)
+                df = map_attack_result(df)
+                df = create_attack_signature(df)
+
+                ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+                df["Attack Start Time"] = ts
+                df["Day"] = ts.dt.date
+                df["Hour"] = ts.dt.hour
+
+                TEXTY_COLS = [
+                    "Addition Info", "Threat Name", "Threat Type", "Threat Subtype",
+                    "Source IP", "Destination IP", "Attacker", "Victim",
+                    "direction", "Severity", "attack_result", "attack_result_label"
+                ]
+                for c in TEXTY_COLS:
+                    if c in df.columns:
+                        df[c] = df[c].astype("string")
+
+                # --- stabilize parquet schema across chunks ---
+                if cols_ref is None:
+                    cols_ref = list(df.columns)
                 else:
-                    raise ValueError("CSV must include 'Attack Start Time' column.")
+                    for c in cols_ref:
+                        if c not in df.columns:
+                            df[c] = pd.NA
+                    df = df.reindex(columns=cols_ref)
 
-            df = _vectorized_parse(df)
-            df = map_attack_result(df)
-            df = create_attack_signature(df)
+                table = pa.Table.from_pandas(df, preserve_index=False)
+                if writer is None:
+                    schema = table.schema
+                    writer = pq.ParquetWriter(out_parquet, schema=schema, compression="zstd", use_dictionary=True)
+                else:
+                    table = table.cast(schema)
+                writer.write_table(table)
 
-            ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
-            df["Attack Start Time"] = ts
-            df["Day"] = ts.dt.date
-            df["Hour"] = ts.dt.hour
+                # --- update a tiny hourly roll-up in memory (few MB) ---
+                g = pd.DataFrame({
+                    "Threat Type": df["Threat Type"].astype(str),
+                    "ds": df["Attack Start Time"].dt.floor("h")
+                })
+                g = g.dropna(subset=["ds"])
+                g = g.groupby(["Threat Type", "ds"]).size().reset_index(name="y")
 
-            TEXTY_COLS = [
-                "Addition Info", "Threat Name", "Threat Type", "Threat Subtype",
-                "Source IP", "Destination IP", "Attacker", "Victim",
-                "direction", "Severity", "attack_result", "attack_result_label"
-            ]
-            for c in TEXTY_COLS:
-                if c in df.columns:
-                    df[c] = df[c].astype("string")
+                if rollup is None:
+                    rollup = g
+                else:
+                    rollup = pd.concat([rollup, g], ignore_index=True)
+                    # collapse periodically to keep it small
+                    if len(rollup) > 250_000:
+                        rollup = rollup.groupby(["Threat Type", "ds"], as_index=False)["y"].sum()
 
-            # stabilize schema across chunks
-            if cols_ref is None:
-                cols_ref = list(df.columns)
-            else:
-                for c in cols_ref:
-                    if c not in df.columns:
-                        df[c] = pd.NA
-                df = df.reindex(columns=cols_ref)
+                rows_done += len(df)
+                prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
 
-            table = pa.Table.from_pandas(df, preserve_index=False)
+            except Exception as e:
+                st.error(f"❌ Error while processing chunk {i:,}: {e}")
+                st.exception(e)
+                raise
 
-            if writer is None:
-                schema = table.schema
-                writer = pq.ParquetWriter(out_parquet, schema=schema, compression="zstd", use_dictionary=True)
-            else:
-                table = table.cast(schema)
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
 
-            writer.write_table(table)
+    # finalize compact roll-up
+    if rollup is None:
+        rollup = pd.DataFrame(columns=["Threat Type", "ds", "y"])
+    else:
+        rollup = rollup.groupby(["Threat Type", "ds"], as_index=False)["y"].sum()
+    rollup["ds"] = pd.to_datetime(rollup["ds"], errors="coerce")
+    counts_out = output_path.replace(".csv", "_hourly_counts.csv")
+    rollup.to_csv(counts_out, index=False)
 
-            rows_done += len(df)
-            prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
-
-        except Exception as e:
-            st.error(f"❌ Error while processing chunk {i:,}: {e}")
-            st.exception(e)
-            # Stop so you can see the real error
-            if writer is not None:
-                try:
-                    writer.close()
-                except Exception:
-                    pass
-            raise
-
-    # close writer at the end
-    if writer is not None:
-        writer.close()
-
+    # write or skip the heavy per-signature summary file
     if fast_mode:
         pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
     else:
+        # If you really need the recurrence summary, do it here (but it loads full parquet).
         df_all = pq.read_table(out_parquet).to_pandas()
         df_final = calculate_recurrence(df_all)
         df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]], on="attack_signature", how="left")
         df_final.to_csv(output_path, index=False)
 
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
-    return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
+    return {
+        "parquet_path": out_parquet,
+        "rows": rows_done,
+        "fast_mode": fast_mode,
+        "counts_path": counts_out,   # <<— new: tiny hourly roll-up to keep in memory
+    }
+
 
 
 # ---------- URL ingest helpers ----------
@@ -886,13 +917,27 @@ WINDOW_CONFIG = {
 
 
 def build_hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns a DF with ['Threat Type','ds','y'].
+    - If df is already a roll-up with those columns, just normalize and return it.
+    - Otherwise, build it from raw rows.
+    """
     if df.empty:
         return df
+
+    # Already aggregated?
+    if {"Threat Type", "ds", "y"}.issubset(df.columns):
+        out = df.copy()
+        out["ds"] = pd.to_datetime(out["ds"], errors="coerce")
+        return out[["Threat Type", "ds", "y"]]
+
+    # Raw → aggregate
     tmp = df.copy()
     tmp["ds"] = pd.to_datetime(tmp["Attack Start Time"], errors="coerce").dt.floor("h")
     tmp["Threat Type"] = tmp.get("Threat Type", "").astype(str)
     grouped = tmp.groupby(["Threat Type", "ds"]).size().reset_index(name="y")
     return grouped
+
 
 
 @st.cache_data(show_spinner=False)
@@ -901,7 +946,20 @@ def hourly_counts_cached(df: pd.DataFrame):
 
 
 def _merge_extra_columns(grouped: pd.DataFrame, raw_df: pd.DataFrame, threat: str) -> pd.DataFrame:
+    """
+    If raw_df lacks 'Attack Start Time' (i.e., we're using pre-aggregated hourly counts),
+    just add neutral columns so model training still works.
+    """
     extra_cols = ["Severity", "attack_result_label", "direction", "duration"]
+
+    # Roll-up only (no raw columns)
+    if "Attack Start Time" not in raw_df.columns:
+        merged = grouped.copy()
+        for c in extra_cols:
+            merged[c] = 0
+        return merged
+
+    # Original behavior with raw rows available
     for c in extra_cols:
         if c not in raw_df.columns:
             raw_df[c] = np.nan
@@ -917,6 +975,7 @@ def _merge_extra_columns(grouped: pd.DataFrame, raw_df: pd.DataFrame, threat: st
     merged["attack_result_label"] = pd.to_numeric(merged["attack_result_label"], errors="coerce").fillna(0)
     merged["duration"] = pd.to_numeric(merged["duration"], errors="coerce").fillna(0)
     return merged
+
 
 
 def _add_time_features(subset: pd.DataFrame) -> pd.DataFrame:
@@ -1326,7 +1385,9 @@ if fetch_btn and url_in:
             state="complete"
         )
 
-    st.metric("Rows in session dataset", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
+    st.metric("Events ingested (raw rows)", value=f"{result['rows']:,}")
+    st.metric("Hourly bins in memory", value=f"{after_bins:,}")
+
 
     # Download processed result + current session dataset
     st.download_button(
@@ -1381,27 +1442,26 @@ if process_btn and uploaded is not None:
         st.write(f"Filas enriquecidas (RAW): **{result['rows']:,}**")
 
         # FIRST vs MERGE messaging
-        is_first = st.session_state.get("session_master_df", pd.DataFrame()).empty
-        st.write("Iniciando dataset de sesión…" if is_first else "Fusionando con el dataset de sesión…")
-
-        try:
-            curr = _load_thin_parquet(result["parquet_path"])
-        except MemoryError:
-            st.error("⚠️ El parquet enriquecido es demasiado grande para cargarlo en memoria ahora.")
-            st.info("Sugerencias: baja el 'chunksize', deja '🚀 Carga rápida' activado, o procesa en partes.")
-            curr = pd.DataFrame()
-
-       # >>> DEBUG: verify what's loaded
-        st.write("Loaded columns:", list(curr.columns))
-        st.write("Shape after thin load:", curr.shape)
-        st.write("Sample:", curr.head(2))
-        master = _append_session_master(curr)
-        after_rows = len(master)
-
+        # FIRST vs MERGE messaging
+        base = st.session_state.get("session_master_df", pd.DataFrame(columns=["Threat Type","ds","y"]))
+        is_first = base.empty
+        st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
+        
+        # Load the tiny hourly roll-up returned by the processor
+        counts_path = result.get("counts_path")
+        counts_df = pd.read_csv(counts_path)
+        counts_df["ds"] = pd.to_datetime(counts_df["ds"], errors="coerce")
+        
+        # Start/merge the session roll-up
+        merged = pd.concat([base, counts_df], ignore_index=True)
+        merged = merged.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
+        st.session_state["session_master_df"] = merged
+        after_bins = len(merged)
+        
         status.update(
-            label=("Primer dataset cargado ✅ (solo sesión; nada persistido)"
+            label=("First dataset loaded ✅ (session roll-up; nothing persisted)"
                    if is_first else
-                   "Fusión completada ✅ (solo sesión; nada persistido)"),
+                   "Merge complete ✅ (session roll-up; nothing persisted)"),
             state="complete"
         )
 

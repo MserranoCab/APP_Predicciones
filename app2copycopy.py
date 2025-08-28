@@ -335,6 +335,17 @@ def calculate_recurrence(df: pd.DataFrame) -> pd.DataFrame:
     agg_info["Avg Time Between Events (hrs)"] = agg_info.apply(_avg_gap, axis=1)
     return pd.merge(first_rows, agg_info, on="attack_signature")
 
+def _quick_row_count(parquet_dir: str) -> int:
+    """Sum row counts from parquet footers (no heavy read)."""
+    total = 0
+    for p in glob.glob(os.path.join(parquet_dir, "*.parquet")):
+        try:
+            md = pq.read_metadata(p)
+            total += md.num_rows or 0
+        except Exception:
+            pass
+    return total
+
 
 def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
     df = pd.read_csv(input_path, low_memory=False)
@@ -606,37 +617,28 @@ def _quick_row_count(parquet_dir: str) -> int:
     return total
 
 def _update_master_with_processed(enriched_info):
-    """Copy the new parquet part into master; try to load master.
-       If loading fails, quarantine the new part and keep going."""
+    """Copy new parquet into master, try to load; quarantine on failure."""
     parquet_path = enriched_info["parquet_path"] if isinstance(enriched_info, dict) else enriched_info
     new_part = _add_enriched_parquet_to_master(parquet_path)
 
     try:
-        # Try to read/union all parts to pandas
         return _read_master_parquet()
-    except MemoryError as e:
-        # Master is too big to materialize right now
-        st.error("Master is too large to fully load after merge (MemoryError). "
-                 "I’ll keep the new part and only show counts for now.")
+    except MemoryError:
+        st.error("Master too large to fully load right after merge (MemoryError).")
         st.info(f"Approx rows (footer-based): {_quick_row_count(MASTER_DS_DIR):,}")
-        # Return an empty DF so caller code doesn’t crash on len()
         return pd.DataFrame()
     except Exception as e:
-        # New part is likely malformed or has impossible casts → quarantine it
         qdir = os.path.join(MASTER_DS_DIR, "_quarantine")
         os.makedirs(qdir, exist_ok=True)
         try:
             shutil.move(new_part, os.path.join(qdir, os.path.basename(new_part)))
         except Exception:
             pass
-        st.error(f"Merging failed; quarantined bad parquet part: **{os.path.basename(new_part)}**.\n\n{e}")
-        # Return whatever master we can read without the bad part
+        st.error(f"Merging failed; quarantined **{os.path.basename(new_part)}**.\n\n{e}")
         try:
             return _read_master_parquet()
         except Exception:
-            # If even that fails, fall back to empty
             return pd.DataFrame()
-
 
 
 def _coverage_stats(df: pd.DataFrame):
@@ -1135,6 +1137,7 @@ fetch_btn = st.button("Fetch & Merge from URL", use_container_width=True, disabl
 
 if fetch_btn and url_in:
     before_rows = len(_read_master())
+
     with st.status("Downloading and processing…", expanded=True) as status:
         ts_tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_no_ext = os.path.join(DATA_DIR, f"remote_{ts_tag}")
@@ -1153,9 +1156,9 @@ if fetch_btn and url_in:
 
         st.write("Merging into master…")
         master = _update_master_with_processed(result)
-        
-        # Prefer a real length if we have a DF, otherwise use footer-based count
-after_rows = len(master) if not master.empty else _quick_row_count(MASTER_DS_DIR)
+
+        # Prefer a real length if we have a DF, otherwise footer-based count
+        after_rows = len(master) if not master.empty else _quick_row_count(MASTER_DS_DIR)
 
         status.update(label="Done ✅", state="complete")
 
@@ -1166,10 +1169,12 @@ after_rows = len(master) if not master.empty else _quick_row_count(MASTER_DS_DIR
         file_name=os.path.basename(processed_path),
         mime="text/csv",
     )
+
     st.session_state["_refresh_after_merge"] = True
     st.cache_data.clear()
     st.cache_resource.clear()
     st.rerun()
+
 
 # ---- File upload path (subject to 200MB Streamlit limit) ----
 colA, colB = st.columns([1, 1])
@@ -1195,8 +1200,9 @@ if process_btn and uploaded is not None:
 
         st.write("Fusionando con el conjunto maestro…")
         master = _update_master_with_processed(result)
-        after_rows = len(master)
+        after_rows = len(master) if not master.empty else _quick_row_count(MASTER_DS_DIR)
         status.update(label="Procesamiento completado ✅", state="complete")
+
 
     st.metric("Filas en master", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")
     st.download_button(

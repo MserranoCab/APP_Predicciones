@@ -593,12 +593,50 @@ def _dedupe_events_by_signature_time(df: pd.DataFrame) -> pd.DataFrame:
         return df
     return df.sort_values("Attack Start Time").drop_duplicates(subset=key, keep="first")
 
+def _quick_row_count(parquet_dir: str) -> int:
+    """Sum num_rows from parquet file footers without loading tables."""
+    total = 0
+    for p in glob.glob(os.path.join(parquet_dir, "*.parquet")):
+        try:
+            md = pq.read_metadata(p)
+            total += md.num_rows or 0
+        except Exception:
+            # ignore unreadable parts here; _read_master_parquet will quarantine later
+            pass
+    return total
 
 def _update_master_with_processed(enriched_info):
+    """Copy the new parquet part into master; try to load master.
+       If loading fails, quarantine the new part and keep going."""
     parquet_path = enriched_info["parquet_path"] if isinstance(enriched_info, dict) else enriched_info
-    _add_enriched_parquet_to_master(parquet_path)
-    df = _read_master_parquet()
-    return df
+    new_part = _add_enriched_parquet_to_master(parquet_path)
+
+    try:
+        # Try to read/union all parts to pandas
+        return _read_master_parquet()
+    except MemoryError as e:
+        # Master is too big to materialize right now
+        st.error("Master is too large to fully load after merge (MemoryError). "
+                 "I’ll keep the new part and only show counts for now.")
+        st.info(f"Approx rows (footer-based): {_quick_row_count(MASTER_DS_DIR):,}")
+        # Return an empty DF so caller code doesn’t crash on len()
+        return pd.DataFrame()
+    except Exception as e:
+        # New part is likely malformed or has impossible casts → quarantine it
+        qdir = os.path.join(MASTER_DS_DIR, "_quarantine")
+        os.makedirs(qdir, exist_ok=True)
+        try:
+            shutil.move(new_part, os.path.join(qdir, os.path.basename(new_part)))
+        except Exception:
+            pass
+        st.error(f"Merging failed; quarantined bad parquet part: **{os.path.basename(new_part)}**.\n\n{e}")
+        # Return whatever master we can read without the bad part
+        try:
+            return _read_master_parquet()
+        except Exception:
+            # If even that fails, fall back to empty
+            return pd.DataFrame()
+
 
 
 def _coverage_stats(df: pd.DataFrame):
@@ -1115,7 +1153,10 @@ if fetch_btn and url_in:
 
         st.write("Merging into master…")
         master = _update_master_with_processed(result)
-        after_rows = len(master)
+        
+        # Prefer a real length if we have a DF, otherwise use footer-based count
+after_rows = len(master) if not master.empty else _quick_row_count(MASTER_DS_DIR)
+
         status.update(label="Done ✅", state="complete")
 
     st.metric("Rows in master", value=f"{after_rows:,}", delta=f"+{after_rows - before_rows:,}")

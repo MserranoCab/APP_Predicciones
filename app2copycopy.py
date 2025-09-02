@@ -1334,7 +1334,7 @@ if fetch_btn and url_in:
         is_first = st.session_state.get("session_master_df", pd.DataFrame()).empty
         st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
 
-                # Load the tiny hourly roll-up returned by the processor
+        # Load the tiny hourly roll-up returned by the processor
         counts_path = result.get("counts_path")
         counts_df = pd.read_csv(counts_path)
         counts_df["ds"] = pd.to_datetime(counts_df["ds"], errors="coerce")
@@ -1345,23 +1345,12 @@ if fetch_btn and url_in:
         merged = merged.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
         st.session_state["session_master_df"] = merged
 
-        master_now = merged
-        after_bins = len(master_now)
-
-
-        # Debug
-        st.write("Loaded columns:", list(curr.columns))
-        st.write("Shape after thin load:", curr.shape)
-        st.write("Sample:", curr.head(2))
-
-        master_now = _append_session_master(curr)
-        # compute hourly bins for the metric
-        after_bins = len(build_hourly_counts(master_now))
+        after_bins = len(merged)
 
         status.update(
-            label=("First dataset loaded ✅ (session only; nothing persisted)"
+            label=("First dataset loaded ✅ (session roll-up; nothing persisted)"
                    if is_first else
-                   "Merge complete ✅ (session only; nothing persisted)"),
+                   "Merge complete ✅ (session roll-up; nothing persisted)"),
             state="complete"
         )
 
@@ -1391,6 +1380,7 @@ if fetch_btn and url_in:
             file_name="session_master.csv",
             mime="text/csv",
         )
+
 
 # ---- File upload path (subject to 200MB Streamlit limit) ----
 colA, colB = st.columns([1, 1])

@@ -391,6 +391,22 @@ def make_usecols_callable(keep_cols: set[str]):
         return (colname in keep_cols) or (str(colname).lower() in lower_keep)
     return _f
 # --------------------------------------------
+def _safe_read_thin_parquet(parquet_path: str, want_cols: list[str]) -> pd.DataFrame:
+    try:
+        pf = pq.ParquetFile(parquet_path)
+        available = set(pf.schema.names)
+        cols = [c for c in want_cols if c in available]
+        if not cols:
+            # nothing available; return empty with schema hint
+            return pd.DataFrame()
+        table = pf.read(columns=cols)
+        df = table.to_pandas()
+        if "Attack Start Time" in df.columns:
+            df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+        return df
+    except Exception as e:
+        st.warning(f"No se pudo leer parquet delgado: {e}")
+        return pd.DataFrame()
 
 
 def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
@@ -1318,16 +1334,20 @@ if fetch_btn and url_in:
         is_first = st.session_state.get("session_master_df", pd.DataFrame()).empty
         st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
 
-        try:
-            curr = None
-            # Try to load a thin slice of the enriched parquet (raw rows, not just roll-up)
-            curr = pq.read_table(result["parquet_path"], columns=[c for c in THIN_COLS if c]).to_pandas()
-            if "Attack Start Time" in curr.columns:
-                curr["Attack Start Time"] = pd.to_datetime(curr["Attack Start Time"], errors="coerce")
-        except MemoryError:
-            st.error("⚠️ The enriched parquet is too large to load into memory right now.")
-            st.info("Tips: lower chunksize, keep 🚀 Fast mode on, or split the file.")
-            curr = pd.DataFrame()
+                # Load the tiny hourly roll-up returned by the processor
+        counts_path = result.get("counts_path")
+        counts_df = pd.read_csv(counts_path)
+        counts_df["ds"] = pd.to_datetime(counts_df["ds"], errors="coerce")
+
+        # Start/merge the session roll-up
+        base = st.session_state.get("session_master_df", pd.DataFrame(columns=["Threat Type","ds","y"]))
+        merged = pd.concat([base, counts_df], ignore_index=True)
+        merged = merged.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
+        st.session_state["session_master_df"] = merged
+
+        master_now = merged
+        after_bins = len(master_now)
+
 
         # Debug
         st.write("Loaded columns:", list(curr.columns))

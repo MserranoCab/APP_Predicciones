@@ -48,6 +48,42 @@ os.makedirs(MASTER_DS_DIR, exist_ok=True)
 MASTER_CSV = os.path.join(DATA_DIR, "master.csv")
 SEED_FLAG = os.path.join(DATA_DIR, ".seeded")
 
+# Minimal input columns for thin ingest (signature + time + optional enrich features)
+THIN_INPUT_COLS = {
+    "Attack Start Time",
+    "First Seen",              # fallback if 'Attack Start Time' not present
+    "Threat Type",
+    "Threat Name",
+    "Threat Subtype",
+    "Severity",
+    "Source IP",
+    "Destination IP",
+    "Attacker",
+    "Victim",
+    "Addition Info",
+    "attack_result",
+    "direction",
+    "duration",
+}
+
+# Slice used when reloading a saved parquet into RAM
+THIN_COLS = [
+    "Attack Start Time",
+    "attack_signature",
+    "Threat Name",
+    "Threat Type",
+    "Threat Subtype",
+    "Severity",
+    "Source IP",
+    "Destination IP",
+    "Attacker",
+    "Victim",
+    # (optional extra features used later)
+    "attack_result_label",
+    "direction",
+    "duration",
+]
+
 # ---- Optional: seed dataset from URL in Secrets on first run ----
 import requests
 DATA_URL = st.secrets.get("DATA_URL", "")
@@ -336,6 +372,7 @@ def calculate_recurrence(df: pd.DataFrame) -> pd.DataFrame:
     agg_info["Avg Time Between Events (hrs)"] = agg_info.apply(_avg_gap, axis=1)
     return pd.merge(first_rows, agg_info, on="attack_signature")
 
+
 def _quick_row_count(parquet_dir: str) -> int:
     """Sum row counts from parquet footers (no heavy read)."""
     total = 0
@@ -346,6 +383,14 @@ def _quick_row_count(parquet_dir: str) -> int:
         except Exception:
             pass
     return total
+
+# --------- NEW: thin ingest helpers ----------
+def make_usecols_callable(keep_cols: set[str]):
+    lower_keep = {c.lower() for c in keep_cols}
+    def _f(colname: str) -> bool:
+        return (colname in keep_cols) or (str(colname).lower() in lower_keep)
+    return _f
+# --------------------------------------------
 
 
 def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
@@ -379,7 +424,13 @@ def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
     return df
 
 
-def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: int = 100_000, fast_mode: bool = True):
+def process_log_csv_with_progress(
+    input_path: str,
+    output_path: str,
+    chunksize: int = 100_000,
+    fast_mode: bool = True,
+    usecols_filter=None,   # <<— NEW: callable or None
+):
     """Stream-read CSV in chunks → enrich → append to one parquet; ALSO build a tiny hourly roll-up for session use."""
     prog = st.progress(0.0, text="Leyendo CSV…")
     rows_done = 0
@@ -417,7 +468,13 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
     rollup = None  # pandas DF with cols: ["Threat Type","ds","y"]
 
     try:
-        for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
+        reader = pd.read_csv(
+            input_path,
+            low_memory=False,
+            chunksize=chunksize,
+            usecols=usecols_filter,   # <<— NEW
+        )
+        for i, df in enumerate(reader):
             try:
                 # --- normalize / enrich this chunk ---
                 df = _normalize_and_uniquify_columns(df)
@@ -432,8 +489,11 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                     else:
                         raise ValueError("CSV must include 'Attack Start Time' column.")
 
+                # Only parse & signature if columns exist (thin ingest may omit some text)
                 df = _vectorized_parse(df)
                 df = map_attack_result(df)
+
+                # You may skip signature in ultra-thin mode, but we keep it:
                 df = create_attack_signature(df)
 
                 ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
@@ -522,7 +582,7 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         "parquet_path": out_parquet,
         "rows": rows_done,
         "fast_mode": fast_mode,
-        "counts_path": counts_out,   # <<— new: tiny hourly roll-up to keep in memory
+        "counts_path": counts_out,   # tiny hourly roll-up to keep in memory
     }
 
 
@@ -727,7 +787,7 @@ def _dedupe_events_by_signature_time(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _quick_row_count(parquet_dir: str) -> int:
+def _quick_row_count_footers(parquet_dir: str) -> int:
     """Sum num_rows from parquet file footers without loading tables."""
     total = 0
     for p in glob.glob(os.path.join(parquet_dir, "*.parquet")):
@@ -735,7 +795,6 @@ def _quick_row_count(parquet_dir: str) -> int:
             md = pq.read_metadata(p)
             total += md.num_rows or 0
         except Exception:
-            # ignore unreadable parts here; _read_master_parquet will quarantine later
             pass
     return total
 
@@ -765,18 +824,18 @@ def _update_master_with_processed(enriched_info):
 
 
 def _coverage_stats(df: pd.DataFrame):
-    if df.empty or "Attack Start Time" not in df.columns:
+    if df.empty or "ds" not in df.columns:
         return None
-    ts = df["Attack Start Time"].dropna()
+    ts = pd.to_datetime(df["ds"], errors="coerce").dropna()
     if ts.empty:
         return None
-    return ts.min(), ts.max(), len(df)
+    return ts.min().date(), ts.max().date(), len(df)
 
 # ------- Stateless (no-master) helpers -------
 def _append_session_master(new_df: pd.DataFrame) -> pd.DataFrame:
     """Append new_df to a session-only master and de-duplicate by time+signature when possible."""
     base = st.session_state.get("session_master_df")
-    if base is None or base.empty:
+    if base is None or len(base) == 0:
         st.session_state["session_master_df"] = _dedupe_events_by_signature_time(new_df)
     else:
         merged = pd.concat([base, new_df], ignore_index=True)
@@ -795,125 +854,6 @@ def _session_master_download_paths() -> tuple[str, str]:
         pq.write_table(pa.Table.from_pandas(df, preserve_index=False), parquet_path, compression="zstd")
         df.to_csv(csv_path, index=False)
     return parquet_path, csv_path
-THIN_COLS = [
-    "Attack Start Time",
-    "attack_signature",
-    "Threat Name",
-    "Threat Type",
-    "Threat Subtype",
-    "Severity",
-    "Source IP",
-    "Destination IP",
-    "Attacker",
-    "Victim",
-    # (optional extra features used later)
-    "attack_result_label",
-    "direction",
-    "duration",
-]
-
-def _load_thin_parquet(parquet_path: str) -> pd.DataFrame:
-    """Load a thin slice of the parquet and ensure we have 'attack_signature'.
-    Falls back to rebuilding it if missing, and uses categories to minimize RAM."""
-    pf = pq.ParquetFile(parquet_path)
-    available = set(pf.schema.names)
-    cols = [c for c in THIN_COLS if c in available]
-    table = pf.read(columns=cols)
-    df = table.to_pandas()
-
-    # Normalize time
-    if "Attack Start Time" in df.columns:
-        df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
-
-    # If signature is missing, rebuild it from available parts
-    if "attack_signature" not in df.columns:
-        parts = [
-            ("Threat Name", ""),
-            ("Threat Type", ""),
-            ("Threat Subtype", ""),
-            ("Severity", ""),
-            ("Source IP", ""),
-            ("Destination IP", ""),
-            ("Attacker", ""),
-            ("Victim", ""),
-        ]
-        have_any = any(col in df.columns for col, _ in parts)
-        if have_any:
-            for col, _ in parts:
-                if col not in df.columns:
-                    df[col] = np.nan
-            df["attack_signature"] = df[[p[0] for p in parts]].astype(str).agg("|".join, axis=1)
-        else:
-            # last resort: make a weak signature that won't over-dedupe
-            df["attack_signature"] = (
-                df.get("Threat Type", pd.Series(["?"] * len(df))).astype(str)
-                + "|" + df.get("Severity", pd.Series(["?"] * len(df))).astype(str)
-                + "|" + df.index.astype(str)
-            )
-            st.warning("attack_signature missing: rebuilt a weak signature to avoid over-dedupe.")
-
-    # Compress memory
-    for c in ["Threat Name","Threat Type","Threat Subtype","Severity","Source IP",
-              "Destination IP","Attacker","Victim","attack_result_label","direction"]:
-        if c in df.columns:
-            try:
-                df[c] = df[c].astype("category")
-            except Exception:
-                pass
-
-    return df
-# -------------------------------
-# Seed/Bootstrap on first run
-# -------------------------------
-def _discover_seed_paths() -> list:
-    candidates = []
-    env_paths = os.environ.get("CYBER_SEED_CSVS", "")
-    if env_paths:
-        candidates.extend([p.strip() for p in env_paths.split(",") if p.strip()])
-    candidates.extend(glob.glob(os.path.join(SEEDS_DIR, "*.csv")))
-    for p in ["BDS_BIG_2MONTHS.csv", "BDS_UNIFICADO.csv", "BDS1.csv", "/mnt/data/BDS1.csv"]:
-        if os.path.exists(p):
-            candidates.append(p)
-    seen, uniq = set(), []
-    for c in candidates:
-        if c not in seen and os.path.exists(c):
-            seen.add(c)
-            uniq.append(c)
-    return uniq
-
-
-def _merge_or_process_seed(path: str):
-    outp = os.path.join(PROCESSED_DIR, f"seed_{os.path.basename(path)}")
-    return process_log_csv_with_progress(path, outp, chunksize=250_000, fast_mode=True)
-
-
-def _bootstrap_seed_data():
-    if glob.glob(os.path.join(MASTER_DS_DIR, "*.parquet")) or os.path.exists(MASTER_CSV):
-        return
-    paths = _discover_seed_paths()
-    if not paths:
-        return
-    for p in paths:
-        try:
-            result = _merge_or_process_seed(p)
-            _update_master_with_processed(result)
-        except Exception as e:
-            st.warning(f"Seed load failed for {p}: {e}")
-    with open(SEED_FLAG, "w") as f:
-        f.write(dt.datetime.now().isoformat())
-
-
-# ==================================================
-# ---- 3) FEATURES / MODEL TRAINING  ----
-# ==================================================
-WINDOW_CONFIG = {
-    "DoS": {"rolling": 3, "lags": [1, 2]},
-    "Scan": {"rolling": 6, "lags": [1, 2, 6]},
-    "Malicious Flow": {"rolling": 12, "lags": [1, 2, 6]},
-    "Vulnerability Attack": {"rolling": 6, "lags": [1, 2, 24]},
-    "Attack": {"rolling": 6, "lags": [1, 2]},
-    "Malfile": {"rolling": 3, "lags": [1, 2]},
-}
 
 
 def build_hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
@@ -937,7 +877,6 @@ def build_hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
     tmp["Threat Type"] = tmp.get("Threat Type", "").astype(str)
     grouped = tmp.groupby(["Threat Type", "ds"]).size().reset_index(name="y")
     return grouped
-
 
 
 @st.cache_data(show_spinner=False)
@@ -977,7 +916,6 @@ def _merge_extra_columns(grouped: pd.DataFrame, raw_df: pd.DataFrame, threat: st
     return merged
 
 
-
 def _add_time_features(subset: pd.DataFrame) -> pd.DataFrame:
     subset = subset.copy()
     subset["y_log"] = np.log1p(subset["y"])
@@ -1015,6 +953,16 @@ def fourier_row(ts, periods=(24, 168), K=3):
 def seasonal_naive_from_counts(history_counts, horizon_hours, period=24):
     hist = np.asarray(history_counts)
     return np.array([hist[-period + (h - 1) % period] for h in range(1, horizon_hours + 1)])
+
+
+WINDOW_CONFIG = {
+    "DoS": {"rolling": 3, "lags": [1, 2]},
+    "Scan": {"rolling": 6, "lags": [1, 2, 6]},
+    "Malicious Flow": {"rolling": 12, "lags": [1, 2, 6]},
+    "Vulnerability Attack": {"rolling": 6, "lags": [1, 2, 24]},
+    "Attack": {"rolling": 6, "lags": [1, 2]},
+    "Malfile": {"rolling": 3, "lags": [1, 2]},
+}
 
 
 def _add_lags_rolls(subset: pd.DataFrame, threat: str):
@@ -1312,7 +1260,7 @@ st.write("Sube un CSV sin procesar → se **procesará** y se **agregará** al *
 
 uploaded = st.file_uploader("Subir CSV (exportación BDS sin procesar)", type=["csv"])
 
-# >>> DEFINE PERFORMANCE CONTROLS *BEFORE* ANY HANDLERS USE THEM  <<<
+# >>> PERFORMANCE CONTROLS <<<
 fast_mode = st.toggle(
     "🚀 Carga rápida (omite resumen de recurrencia ahora)",
     value=True,
@@ -1324,6 +1272,12 @@ chunksize_opt = st.select_slider(
     value=250_000,
     format_func=lambda x: f"{x:,} filas",
 )
+# NEW: Thin ingest toggle
+thin_ingest = st.toggle(
+    "🪶 Thin ingest (usar solo columnas relevantes)",
+    value=True,
+    help="Lee solo las columnas necesarias para firma, hora, y features del modelo (reduce memoria).",
+)
 
 # ---- URL ingestion (bypasses 200MB uploader limit) ----
 st.markdown("**O pega un enlace (Dropbox / Google Drive / S3 / HTTPS):**")
@@ -1331,8 +1285,8 @@ url_in = st.text_input("URL a un CSV (o .gz/.zip con un CSV dentro)", placeholde
 fetch_btn = st.button("Fetch & Merge from URL", use_container_width=True, disabled=not url_in)
 
 if fetch_btn and url_in:
-    # Always compute before_rows from the session dataset
-    before_rows = len(st.session_state.get("session_master_df", pd.DataFrame()))
+    before_df = st.session_state.get("session_master_df", pd.DataFrame()).copy()
+    before_bins = len(build_hourly_counts(before_df)) if not before_df.empty else 0
 
     with st.status("Downloading and processing…", expanded=True) as status:
         ts_tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1349,11 +1303,14 @@ if fetch_btn and url_in:
 
         processed_path = os.path.join(PROCESSED_DIR, f"processed_{ts_tag}.csv")
         st.write("Reading & enriching CSV (session mode)…")
+
+        usecols_cb = make_usecols_callable(THIN_INPUT_COLS) if thin_ingest else None
         result = process_log_csv_with_progress(
             csv_local_path,
             processed_path,
             chunksize=chunksize_opt,
             fast_mode=fast_mode,
+            usecols_filter=usecols_cb,
         )
         st.write(f"Rows enriched (RAW): **{result['rows']:,}**")
 
@@ -1362,21 +1319,24 @@ if fetch_btn and url_in:
         st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
 
         try:
-            curr = _load_thin_parquet(result["parquet_path"])
+            curr = None
+            # Try to load a thin slice of the enriched parquet (raw rows, not just roll-up)
+            curr = pq.read_table(result["parquet_path"], columns=[c for c in THIN_COLS if c]).to_pandas()
+            if "Attack Start Time" in curr.columns:
+                curr["Attack Start Time"] = pd.to_datetime(curr["Attack Start Time"], errors="coerce")
         except MemoryError:
             st.error("⚠️ The enriched parquet is too large to load into memory right now.")
             st.info("Tips: lower chunksize, keep 🚀 Fast mode on, or split the file.")
             curr = pd.DataFrame()
 
-        # >>> DEBUG: verify what's loaded
+        # Debug
         st.write("Loaded columns:", list(curr.columns))
         st.write("Shape after thin load:", curr.shape)
         st.write("Sample:", curr.head(2))
-        # <<< DEBUG
-        
-        master = _append_session_master(curr)
 
-        after_rows = len(master)
+        master_now = _append_session_master(curr)
+        # compute hourly bins for the metric
+        after_bins = len(build_hourly_counts(master_now))
 
         status.update(
             label=("First dataset loaded ✅ (session only; nothing persisted)"
@@ -1386,8 +1346,7 @@ if fetch_btn and url_in:
         )
 
     st.metric("Events ingested (raw rows)", value=f"{result['rows']:,}")
-    st.metric("Hourly bins in memory", value=f"{after_bins:,}")
-
+    st.metric("Hourly bins in memory", value=f"{after_bins:,}", delta=f"+{after_bins - before_bins:,}")
 
     # Download processed result + current session dataset
     st.download_button(
@@ -1422,7 +1381,8 @@ with colB:
     process_btn = st.button("Process & Merge", type="primary", use_container_width=True, disabled=uploaded is None)
 
 if process_btn and uploaded is not None:
-    before_rows = len(st.session_state.get("session_master_df", pd.DataFrame()))
+    base = st.session_state.get("session_master_df", pd.DataFrame(columns=["Threat Type","ds","y"]))
+    before_rows = len(base)
 
     with st.status("Procesando archivo…", expanded=True) as status:
         raw_path = os.path.join(DATA_DIR, f"upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
@@ -1433,31 +1393,32 @@ if process_btn and uploaded is not None:
 
         processed_path = os.path.join(PROCESSED_DIR, outname)
         st.write("Leyendo y enriqueciendo CSV (modo sesión)…")
+
+        usecols_cb = make_usecols_callable(THIN_INPUT_COLS) if thin_ingest else None
         result = process_log_csv_with_progress(
             raw_path,
             processed_path,
             chunksize=chunksize_opt,
-            fast_mode=fast_mode
+            fast_mode=fast_mode,
+            usecols_filter=usecols_cb,
         )
         st.write(f"Filas enriquecidas (RAW): **{result['rows']:,}**")
 
         # FIRST vs MERGE messaging
-        # FIRST vs MERGE messaging
-        base = st.session_state.get("session_master_df", pd.DataFrame(columns=["Threat Type","ds","y"]))
         is_first = base.empty
         st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
-        
+
         # Load the tiny hourly roll-up returned by the processor
         counts_path = result.get("counts_path")
         counts_df = pd.read_csv(counts_path)
         counts_df["ds"] = pd.to_datetime(counts_df["ds"], errors="coerce")
-        
+
         # Start/merge the session roll-up
         merged = pd.concat([base, counts_df], ignore_index=True)
         merged = merged.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
         st.session_state["session_master_df"] = merged
-        after_bins = len(merged)
-        
+        after_rows = len(merged)
+
         status.update(
             label=("First dataset loaded ✅ (session roll-up; nothing persisted)"
                    if is_first else

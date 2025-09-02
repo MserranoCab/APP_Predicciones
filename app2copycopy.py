@@ -885,6 +885,9 @@ def build_hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
     if {"Threat Type", "ds", "y"}.issubset(df.columns):
         out = df.copy()
         out["ds"] = pd.to_datetime(out["ds"], errors="coerce")
+        # NEW: force y numeric, nonnegative
+        out["y"] = pd.to_numeric(out["y"], errors="coerce").fillna(0)
+        out["y"] = out["y"].clip(lower=0)
         return out[["Threat Type", "ds", "y"]]
 
     # Raw → aggregate
@@ -892,6 +895,9 @@ def build_hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
     tmp["ds"] = pd.to_datetime(tmp["Attack Start Time"], errors="coerce").dt.floor("h")
     tmp["Threat Type"] = tmp.get("Threat Type", "").astype(str)
     grouped = tmp.groupby(["Threat Type", "ds"]).size().reset_index(name="y")
+    # NEW: ensure numeric (size() is already numeric, but keep symmetric)
+    grouped["y"] = pd.to_numeric(grouped["y"], errors="coerce").fillna(0)
+    grouped["y"] = grouped["y"].clip(lower=0)
     return grouped
 
 
@@ -934,6 +940,11 @@ def _merge_extra_columns(grouped: pd.DataFrame, raw_df: pd.DataFrame, threat: st
 
 def _add_time_features(subset: pd.DataFrame) -> pd.DataFrame:
     subset = subset.copy()
+    subset["y"] = pd.to_numeric(subset["y"], errors="coerce").fillna(0)
+    subset["y"] = subset["y"].clip(lower=0)
+
+    subset["y_log"] = np.log1p(subset["y"])
+    subset["hour"] = subset["ds"].dt.hour
     subset["y_log"] = np.log1p(subset["y"])
     subset["hour"] = subset["ds"].dt.hour
     subset["dayofweek"] = subset["ds"].dt.dayofweek
@@ -1014,6 +1025,8 @@ def train_xgb_for_threat(master_df: pd.DataFrame, threat: str, test_days: int = 
         return None
 
     sub = grouped[grouped["Threat Type"] == threat].copy()
+    sub["y"] = pd.to_numeric(sub["y"], errors="coerce").fillna(0)
+    sub["y"] = sub["y"].clip(lower=0)
     if len(sub) < 150:
         return None
 

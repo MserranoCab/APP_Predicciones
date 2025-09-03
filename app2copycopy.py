@@ -15,6 +15,7 @@ import shutil
 import gzip
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
@@ -157,7 +158,7 @@ def _vectorized_parse(df_chunk: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============== PARQUET SCHEMA UNION HELPERS ===============
-def _resolve_common_type(name: str, old_t: pa.DataType | None, new_t: pa.DataType | None) -> pa.DataType:
+def _resolve_common_type(name: str, old_t: Optional[pa.DataType], new_t: Optional[pa.DataType]) -> pa.DataType:
     # Pin known columns; fallback to large_string on conflict.
     if name == "Attack Start Time":
         return pa.timestamp("ns")
@@ -172,7 +173,7 @@ def _resolve_common_type(name: str, old_t: pa.DataType | None, new_t: pa.DataTyp
         return old_t
     return old_t if old_t == new_t else pa.large_string()
 
-def _cast_to_schema(tbl: pa.Table, schema_map: dict[str, pa.DataType]) -> pa.Table:
+def _cast_to_schema(tbl: pa.Table, schema_map: dict) -> pa.Table:
     arrays, names = [], []
     n = tbl.num_rows
     for name, typ in schema_map.items():
@@ -608,9 +609,9 @@ def forecast_recursive(
     threat: str,
     horizon_days: int,
     model_bundle: dict,
-    seasonality_strength: float | None = None,
-    noise_level: float | None = None,
-    spike_prob: float | None = None,
+    seasonality_strength: Optional[float] = None,
+    noise_level: Optional[float] = None,
+    spike_prob: Optional[float] = None,
     seed: int = 1234,
 ):
     rng = np.random.default_rng(seed)

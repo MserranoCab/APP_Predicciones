@@ -205,63 +205,95 @@ def read_master_cached():
     return _read_master()
 
 def _read_master_parquet() -> pd.DataFrame:
+    import pyarrow.dataset as ds
+
     part_paths = sorted(glob.glob(os.path.join(MASTER_DS_DIR, "*.parquet")))
     if not part_paths:
         return pd.DataFrame()
 
-    qdir = os.path.join(MASTER_DS_DIR, "_quarantine")
-    os.makedirs(qdir, exist_ok=True)
+    # Build a dataset from parts; this unifies schemas across files.
+    dataset = ds.dataset(part_paths, format="parquet")  # ignore_prefixes=["_"] optional
 
-    # Determine union target schema by scanning parts
-    observed = {}
-    good_paths = []
-    for p in part_paths:
-        try:
-            t = pq.read_table(p)
-            for f in t.schema:
-                observed.setdefault(f.name, f.type)
-            good_paths.append(p)
-        except Exception as e:
+    # Read to a single table (schema is unified by dataset).
+    try:
+        table = dataset.to_table(use_threads=True)
+    except Exception as e:
+        # If something is still off, quarantine bad parts to keep the app alive
+        qdir = os.path.join(MASTER_DS_DIR, "_quarantine")
+        os.makedirs(qdir, exist_ok=True)
+        # Try to find the offending file by binary search-ish scan
+        good = []
+        for p in part_paths:
             try:
-                shutil.move(p, os.path.join(qdir, os.path.basename(p)))
-            except Exception:
-                pass
-            st.warning(f"Quarantined bad parquet: {os.path.basename(p)} — {e}")
-
-    if not good_paths:
-        return pd.DataFrame()
-
-    # Construct a relaxed target schema (string for unknowns, pin times)
-    names = sorted(observed.keys())
-    schema_map = {}
-    for name in names:
-        typ = observed[name]
-        schema_map[name] = _resolve_common_type(name, typ, typ)
-
-    tables = []
-    for p in good_paths:
+                t = pq.read_table(p)
+                good.append(t)
+            except Exception as ee:
+                try:
+                    shutil.move(p, os.path.join(qdir, os.path.basename(p)))
+                except Exception:
+                    pass
+                st.warning(f"Quarantined bad parquet: {os.path.basename(p)} — {ee}")
+        if not good:
+            return pd.DataFrame()
         try:
-            tbl = pq.read_table(p)
-            tbl_cast = _cast_to_schema(tbl, schema_map)
-            tables.append(tbl_cast)
-        except Exception as e:
+            # Last resort (small # of parts): vertically stack what we could read
+            table = pa.concat_tables(good, promote=True)
+        except Exception as e2:
+            # Absolute fallback: load each to pandas then concat (slow, but unblocks)
+            dfs = []
+            for t in good:
+                dfs.append(t.to_pandas())
+            if not dfs:
+                return pd.DataFrame()
+            df = pd.concat(dfs, ignore_index=True)
+            # Normalize time columns
+            if "Attack Start Time" in df.columns:
+                df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+                df["Day"] = df["Attack Start Time"].dt.date.astype(str)
+                df["Hour"] = df["Attack Start Time"].dt.hour
+            return _dedupe_events_by_signature_time(df)
+
+    # === Post-cast critical columns deterministically ===
+    # We rebuild arrays without preserving metadata to avoid concat conflicts later.
+    def _safe_cast(tab: pa.Table, col: str, typ: pa.DataType):
+        if col not in tab.column_names:
+            return tab.append_column(col, pa.nulls(tab.num_rows, type=typ))
+        arr = tab[col]
+        if arr.type == typ:
+            return tab
+        try:
+            carr = pc.cast(arr, typ)
+        except Exception:
+            # final fallback: string then cast or keep string if cast fails
             try:
-                shutil.move(p, os.path.join(qdir, os.path.basename(p)))
+                sarr = pa.array(arr.to_pandas().astype(str), type=pa.large_string())
+                carr = pc.cast(sarr, typ) if pa.types.is_timestamp(typ) or pa.types.is_integer(typ) else sarr
             except Exception:
-                pass
-            st.warning(f"Quarantined during cast: {os.path.basename(p)} — {e}")
+                carr = pa.array(arr.to_pandas().astype(str), type=pa.large_string())
+                typ = pa.large_string()
+        # Replace column (build new table to drop metadata differences)
+        cols = [c for c in tab.column_names]
+        arrays = [tab[c] if c != col else carr for c in cols]
+        return pa.table(arrays, names=cols)
 
-    if not tables:
-        return pd.DataFrame()
+    # Desired target types
+    targets = {
+        "Attack Start Time": pa.timestamp("ns"),
+        "Day": pa.large_string(),
+        "Hour": pa.int64(),
+    }
+    for name, typ in targets.items():
+        table = _safe_cast(table, name, typ)
 
-    table = pa.concat_tables(tables, promote=True)
+    # Convert to pandas and do final conveniences
     df = table.to_pandas()
 
-    # Final post-cast enhancements
     if "Attack Start Time" in df.columns:
         df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+        # Re-derive Day/Hour from the actual timestamp to be 100% consistent
         df["Day"] = df["Attack Start Time"].dt.date.astype(str)
         df["Hour"] = df["Attack Start Time"].dt.hour
+
     df = _dedupe_events_by_signature_time(df)
     return df
 

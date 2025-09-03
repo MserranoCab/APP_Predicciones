@@ -808,13 +808,13 @@ with st.sidebar:
 st.subheader("1) Agrega Información para Entrenar el Modelo")
 st.markdown("""
 Sube un archivo CSV, ZIP (conteniendo un CSV), o comprimido (.gz). Archivos grandes (>200MB descomprimidos) se procesan automáticamente en partes.
-- **Recomendación**: Comprime tu CSV a .gz o ZIP para archivos grandes (reduce el tamaño significativamente).
-- **Nota**: En Streamlit Community Cloud, el límite es 200MB. Para archivos más grandes descomprimidos, usa despliegue local con la configuración recomendada o asegúrate de que el archivo comprimido (ZIP/.gz) sea <200MB.
+- **Recomendación**: Comprime tu CSV a .gz o ZIP para archivos grandes (reduce el tamaño significativamente) o divide en partes si supera 200MB descomprimido.
+- **Nota**: En Streamlit Community Cloud, el límite es 200MB para el archivo subido. Para archivos descomprimidos >200MB, usa despliegue local con `server.maxUploadSize` configurado o sube un ZIP con partes menores.
 """)
 
 # Performance controls
 fast_mode = st.toggle("🚀 Carga rápida (omite resumen de recurrencia)", value=True)
-chunksize_opt = st.select_slider("Tamaño de chunk para procesar", options=[100_000, 150_000, 200_000, 250_000, 300_000], value=250_000, format_func=lambda x: f"{x:,} filas")
+chunksize_opt = st.select_slider("Tamaño de chunk para procesar", options=[50_000, 100_000, 150_000, 200_000, 250_000], value=100_000, format_func=lambda x: f"{x:,} filas")
 
 # File Upload
 uploaded_file = st.file_uploader("Subir CSV, ZIP o .gz", type=["csv", "zip", "gz"])
@@ -837,33 +837,42 @@ if process_btn and uploaded_file:
         
         if uploaded_file.name.endswith(".zip"):
             with zipfile.ZipFile(uploaded_file, "r") as zip_ref:
-                csv_name = [name for name in zip_ref.namelist() if name.endswith(".csv")]
-                if not csv_name:
-                    st.error("No CSV file found in the ZIP archive.")
-                    status.update(label="Error: No CSV in ZIP", state="error")
-                    st.stop()
-                csv_name = csv_name[0]
-                raw_path += ".csv"
-                with zip_ref.open(csv_name) as f_in, open(raw_path, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
+                for csv_name in [name for name in zip_ref.namelist() if name.endswith(".csv")]:
+                    raw_path_part = raw_path + f"_part_{os.path.basename(csv_name).replace('.csv', '')}.csv"
+                    with zip_ref.open(csv_name) as f_in, open(raw_path_part, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
+                    processed_path = os.path.join(PROCESSED_DIR, f"{outname}_{os.path.basename(csv_name)}")
+                    result = process_log_csv_with_progress(raw_path_part, processed_path, chunksize=chunksize_opt, fast_mode=fast_mode)
+                    master = _update_master_with_processed(result)
+                    total_rows_processed += result["rows"]
+                    processed_files.append(processed_path)
+                    st.write(f"Archivo {csv_name}: {result['rows']:,} filas procesadas.")
         elif uploaded_file.name.endswith(".gz"):
             raw_path += ".csv"
             with gzip.open(uploaded_file, "rb") as f_in, open(raw_path, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
+            file_size_mb = os.path.getsize(raw_path) / (1024 * 1024)
+            if file_size_mb > 200:
+                st.warning(f"Archivo descomprimido grande ({file_size_mb:.2f}MB). Procesando en partes.")
+            processed_path = os.path.join(PROCESSED_DIR, outname)
+            result = process_log_csv_with_progress(raw_path, processed_path, chunksize=chunksize_opt, fast_mode=fast_mode)
+            master = _update_master_with_processed(result)
+            total_rows_processed = result["rows"]
+            processed_files.append(processed_path)
+            st.write(f"Archivo {uploaded_file.name}: {result['rows']:,} filas procesadas.")
         else:  # CSV
             raw_path += ".csv"
             with open(raw_path, "wb") as f_out:
                 shutil.copyfileobj(uploaded_file, f_out, length=16 * 1024 * 1024)
-
-        file_size_mb = os.path.getsize(raw_path) / (1024 * 1024)
-        if file_size_mb > 200:
-            st.warning(f"Archivo descomprimido grande ({file_size_mb:.2f}MB). Procesando en partes. Asegúrate de que el archivo comprimido (ZIP/.gz) sea <200MB en Streamlit Community Cloud.")
-        processed_path = os.path.join(PROCESSED_DIR, outname)
-        result = process_log_csv_with_progress(raw_path, processed_path, chunksize=chunksize_opt, fast_mode=fast_mode)
-        master = _update_master_with_processed(result)
-        total_rows_processed = result["rows"]
-        processed_files.append(processed_path)
-        st.write(f"Archivo {uploaded_file.name}: {result['rows']:,} filas procesadas.")
+            file_size_mb = os.path.getsize(raw_path) / (1024 * 1024)
+            if file_size_mb > 200:
+                st.warning(f"Archivo descomprimido grande ({file_size_mb:.2f}MB). Procesando en partes.")
+            processed_path = os.path.join(PROCESSED_DIR, outname)
+            result = process_log_csv_with_progress(raw_path, processed_path, chunksize=chunksize_opt, fast_mode=fast_mode)
+            master = _update_master_with_processed(result)
+            total_rows_processed = result["rows"]
+            processed_files.append(processed_path)
+            st.write(f"Archivo {uploaded_file.name}: {result['rows']:,} filas procesadas.")
         status.update(label=f"Procesamiento completado ✅ ({total_rows_processed:,} filas)", state="complete")
 
     after_rows = len(master)
@@ -964,7 +973,7 @@ else:
 st.divider()
 st.subheader("Notas y Limitaciones")
 st.markdown("""
-- **Archivos grandes**: Archivos descomprimidos >200MB se procesan en partes automáticamente. Asegúrate de que el archivo comprimido (ZIP/.gz) sea <200MB en Streamlit Community Cloud.
+- **Archivos grandes**: Archivos descomprimidos >200MB se procesan en partes automáticamente. Asegúrate de que el archivo comprimido (ZIP/.gz) sea <200MB en Streamlit Community Cloud, o divide en partes y sube como un ZIP con múltiples CSVs.
 - **Persistencia**: Los datos procesados se añaden a `data/master_parquet/` como partes Parquet.
 - **Consejo**: Ajusta el tamaño de chunk si encuentras problemas de memoria.
 - **Despliegue**: Para archivos descomprimidos >200MB, considera un despliegue local con `server.maxUploadSize` configurado (ver instrucciones).

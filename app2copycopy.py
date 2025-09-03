@@ -288,7 +288,7 @@ def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
     df = parse_addition_info_column(df)
     df = map_attack_result(df)
     df = create_attack_signature(df)
-    df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+    df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce").astype(str)
     df["Day"] = df["Attack Start Time"].dt.date
     df["Hour"] = df["Attack Start Time"].dt.hour
     raw_out = output_path.replace(".csv", "_enriched_raw.csv")
@@ -326,14 +326,14 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         if "attack_result" not in df.columns: df["attack_result"] = np.nan
         if "Attack Start Time" not in df.columns:
             if "First Seen" in df.columns:
-                df["Attack Start Time"] = pd.to_datetime(df["First Seen"], errors="coerce")
+                df["Attack Start Time"] = pd.to_datetime(df["First Seen"], errors="coerce").astype(str)
             else:
                 raise ValueError("CSV must include 'Attack Start Time' column.")
         df = _vectorized_parse(df)
         df = map_attack_result(df)
         df = create_attack_signature(df)
         ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
-        df["Attack Start Time"] = ts
+        df["Attack Start Time"] = ts.astype(str) if ts.notna().any() else df["Attack Start Time"]
         df["Day"] = ts.dt.date
         df["Hour"] = ts.dt.hour
         TEXTY_COLS = [
@@ -350,20 +350,29 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
                 pq.write_table(table, out_parquet, compression="zstd", use_dictionary=True)
             else:
                 old = pq.read_table(out_parquet)
-                # Validate schemas
-                if not old.schema.equals(table.schema, check_metadata=False):
-                    st.warning(f"Schema mismatch detected at chunk {i}. Attempting to align...")
-                    # Align schemas by adding missing columns with nulls
-                    for name in old.schema.names:
+                # Detailed schema comparison
+                old_schema = {field.name: field.type for field in old.schema}
+                new_schema = {field.name: field.type for field in table.schema}
+                mismatch = {k: (old_schema.get(k), new_schema.get(k)) for k in set(old_schema) | set(new_schema) if old_schema.get(k) != new_schema.get(k)}
+                if mismatch:
+                    st.warning(f"Schema mismatch at chunk {i}: {mismatch}. Attempting to align...")
+                    # Align schemas with forced string type for problematic columns
+                    for name in old_schema:
                         if name not in table.column_names:
-                            table = table.append_column(name, pa.array([None] * table.num_rows, type=old.schema.field(name).type))
-                    for name in table.column_names:
-                        if name not in old.schema.names:
-                            old = old.append_column(name, pa.array([None] * old.num_rows, type=table.schema.field(name).type))
+                            table = table.append_column(name, pa.array([None] * table.num_rows, type=old_schema[name]))
+                        elif old_schema[name] != new_schema[name]:
+                            table = table.set_column(table.column_names.index(name), name, pa.array(table[name].to_pandas().astype(str), type=pa.large_string()))
+                    for name in new_schema:
+                        if name not in old_schema:
+                            old = old.append_column(name, pa.array([None] * old.num_rows, type=new_schema[name]))
+                        elif old_schema[name] != new_schema[name]:
+                            old = old.set_column(old.column_names.index(name), name, pa.array(old[name].to_pandas().astype(str), type=pa.large_string()))
                 merged = pa.concat_tables([old, table], promote=True)
                 pq.write_table(merged, out_parquet, compression="zstd", use_dictionary=True)
         except Exception as e:
-            st.error(f"Failed to concatenate tables at chunk {i}: {str(e)}")
+            st.error(f"Failed to concatenate tables at chunk {i}: {str(e)}. Check schema mismatch details above.")
+            st.write(f"Old schema: {old_schema}")
+            st.write(f"New schema: {new_schema}")
             break
         rows_done += len(df)
         prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
@@ -814,7 +823,7 @@ Sube un archivo CSV, ZIP (conteniendo un CSV), o comprimido (.gz). Archivos gran
 
 # Performance controls
 fast_mode = st.toggle("🚀 Carga rápida (omite resumen de recurrencia)", value=True)
-chunksize_opt = st.select_slider("Tamaño de chunk para procesar", options=[50_000, 100_000, 150_000, 200_000, 250_000], value=100_000, format_func=lambda x: f"{x:,} filas")
+chunksize_opt = st.select_slider("Tamaño de chunk para procesar", options=[50_000, 100_000, 150_000, 200_000, 250_000], value=50_000, format_func=lambda x: f"{x:,} filas")
 
 # File Upload
 uploaded_file = st.file_uploader("Subir CSV, ZIP o .gz", type=["csv", "zip", "gz"])
@@ -975,7 +984,7 @@ st.subheader("Notas y Limitaciones")
 st.markdown("""
 - **Archivos grandes**: Archivos descomprimidos >200MB se procesan en partes automáticamente. Asegúrate de que el archivo comprimido (ZIP/.gz) sea <200MB en Streamlit Community Cloud, o divide en partes y sube como un ZIP con múltiples CSVs.
 - **Persistencia**: Los datos procesados se añaden a `data/master_parquet/` como partes Parquet.
-- **Consejo**: Ajusta el tamaño de chunk si encuentras problemas de memoria.
+- **Consejo**: Ajusta el tamaño de chunk si encuentras problemas de memoria. Si el error persiste, preprocess the CSV locally.
 - **Despliegue**: Para archivos descomprimidos >200MB, considera un despliegue local con `server.maxUploadSize` configurado (ver instrucciones).
 """)
 st.caption("© Streamlit + XGBoost")

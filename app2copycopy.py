@@ -283,10 +283,36 @@ def _write_master(df: pd.DataFrame):
     Path(tmp).unlink(missing_ok=True)
 
 def _update_master_with_processed(enriched_info):
-    parquet_path = enriched_info["parquet_path"] if isinstance(enriched_info, dict) else enriched_info
-    _add_enriched_parquet_to_master(parquet_path)
+    """
+    Accept:
+      - dict with 'parquet_parts_dir' or 'parquet_paths'
+      - single parquet file path (legacy)
+    Copy each part into MASTER_DS_DIR without loading them (O(n) I/O).
+    """
+    paths = []
+    if isinstance(enriched_info, dict):
+        if "parquet_paths" in enriched_info and enriched_info["parquet_paths"]:
+            paths = enriched_info["parquet_paths"]
+        elif "parquet_parts_dir" in enriched_info and enriched_info["parquet_parts_dir"]:
+            paths = sorted(glob.glob(os.path.join(enriched_info["parquet_parts_dir"], "*.parquet")))
+        elif "parquet_path" in enriched_info:
+            paths = [enriched_info["parquet_path"]]
+    else:
+        paths = [enriched_info]
+
+    if not paths:
+        return _read_master_parquet()
+
+    for p in paths:
+        try:
+            _add_enriched_parquet_to_master(p)
+        except Exception as e:
+            st.warning(f"Failed to add part {os.path.basename(p)}: {e}")
+
+    # Now reload master from parts (the reader already unions/casts schema)
     df = _read_master_parquet()
     return df
+
 
 def _coverage_stats(df: pd.DataFrame):
     if df.empty or "Attack Start Time" not in df.columns:
@@ -395,10 +421,17 @@ def process_log_csv(input_path: str, output_path: str) -> pd.DataFrame:
 
 # =============== CSV -> ENRICH -> PARQUET (chunked) ===============
 def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: int = 250_000, fast_mode: bool = True):
+    """
+    Stream rows in chunks and write EACH chunk to its own parquet 'part' file.
+    We never read previously-written data during the loop (O(n) total).
+    """
     prog = st.progress(0.0, text="Leyendo CSV…")
     rows_done = 0
-    out_parquet = output_path.replace(".csv", ENRICH_SUFFIX_PARQUET)
-    Path(out_parquet).unlink(missing_ok=True)
+
+    # We'll write parts to a folder instead of one growing file.
+    parts_dir = output_path.replace(".csv", "_enriched_parts")
+    shutil.rmtree(parts_dir, ignore_errors=True)
+    os.makedirs(parts_dir, exist_ok=True)
 
     TEXTY_COLS = [
         "Addition Info", "Threat Name", "Threat Type", "Threat Subtype",
@@ -406,7 +439,8 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         "direction", "Severity", "attack_result", "attack_result_label"
     ]
 
-    for i, df in enumerate(pd.read_csv(input_path, low_memory=False, chunksize=chunksize)):
+    part_idx = 0
+    for i, df in enumerate(pd.read_csv(input_path, low_memory=True, chunksize=chunksize)):
         df = _normalize_and_uniquify_columns(df)
 
         # ensure required columns exist
@@ -431,41 +465,44 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
         df["Day"] = ts.dt.strftime("%Y-%m-%d")
         df["Hour"] = ts.dt.hour
 
-        # write/append with schema union-cast
-        if not Path(out_parquet).exists():
-            table = pa.Table.from_pandas(df, preserve_index=False)
-            pq.write_table(table, out_parquet, compression="zstd", use_dictionary=True)
-        else:
-            old = pq.read_table(out_parquet)
-            new = pa.Table.from_pandas(df, preserve_index=False)
-
-            all_names = sorted(set(old.column_names) | set(new.column_names))
-            schema_map = {}
-            for name in all_names:
-                old_t = old.schema.field(name).type if name in old.column_names else None
-                new_t = new.schema.field(name).type if name in new.column_names else None
-                schema_map[name] = _resolve_common_type(name, old_t, new_t)
-
-            old_cast = _cast_to_schema(old, schema_map)
-            new_cast = _cast_to_schema(new, schema_map)
-
-            merged = pa.concat_tables([old_cast, new_cast], promote=True)
-            pq.write_table(merged, out_parquet, compression="zstd", use_dictionary=True)
+        # write this chunk as its own parquet part (no read/concat)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        part_path = os.path.join(parts_dir, f"part-{part_idx:05d}.parquet")
+        pq.write_table(table, part_path, compression="zstd", use_dictionary=True)
+        part_idx += 1
 
         rows_done += len(df)
-        prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
+        if rows_done:
+            frac = min(0.99, 0.05 + rows_done / max(rows_done, 1_000_000))  # cosmetic progress
+        else:
+            frac = 0.05
+        prog.progress(frac, text=f"Procesadas ~{rows_done:,} filas")
 
+        # free memory ASAP
+        del df, table
+
+    # Optional CSV summary
     if not fast_mode:
-        df_all = pq.read_table(out_parquet).to_pandas()
+        # Read only ONCE at the end if user wants recurrence summary
+        # This will use chunked parquet scan under the hood.
+        ds = pq.ParquetDataset(parts_dir)
+        df_all = ds.read().to_pandas()
         df_final = calculate_recurrence(df_all)
-        df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]], on="attack_signature", how="left")
+        df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]].drop_duplicates(), on="attack_signature", how="left")
         df_final.to_csv(output_path, index=False)
+        del df_all, df_final
     else:
         pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
 
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
-    return {"parquet_path": out_parquet, "rows": rows_done, "fast_mode": fast_mode}
 
+    return {
+        "parquet_parts_dir": parts_dir,
+        "rows": rows_done,
+        "fast_mode": fast_mode,
+        # keep legacy key for compatibility with _update_master_with_processed
+        "parquet_paths": sorted(glob.glob(os.path.join(parts_dir, "*.parquet")))
+    }
 
 # =============== FEATURES / MODELING ===============
 WINDOW_CONFIG = {

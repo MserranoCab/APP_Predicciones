@@ -357,10 +357,66 @@ def _quick_row_count(parquet_dir: str) -> int:
 
 
 def make_usecols_callable(keep_cols: set[str]):
+    """Keep known columns AND anything that looks like a timestamp so thin ingest never drops it."""
     lower_keep = {c.lower() for c in keep_cols}
+    time_tokens = [
+        "time", "timestamp", "@timestamp", "first seen", "first_seen",
+        "start time", "event time", "datetime", "fecha", "date"
+    ]
     def _f(colname: str) -> bool:
-        return (colname in keep_cols) or (str(colname).lower() in lower_keep)
+        name = str(colname)
+        lname = name.lower()
+        if (name in keep_cols) or (lname in lower_keep):
+            return True
+        if any(tok in lname for tok in time_tokens):
+            return True
+        return False
     return _f
+
+def _norm(s: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+TIME_CANDIDATES_EXACT = [
+    "Attack Start Time", "Attack Start Time (UTC)",
+    "First Seen", "First Seen (UTC)",
+    "Start Time", "Event Time", "EventTime",
+    "Timestamp", "@timestamp", "Time", "Datetime", "Date", "LogTime"
+]
+
+def _find_time_col(cols) -> str | None:
+    # 1) exact/synonym match (case/punct insensitive)
+    norm_map = {_norm(c): c for c in cols}
+    for name in TIME_CANDIDATES_EXACT:
+        k = _norm(name)
+        if k in norm_map:
+            return norm_map[k]
+    # 2) fuzzy tokens
+    tokens = ["timestamp", "firstseen", "attackstart", "starttime", "eventtime", "time", "datetime", "date", "fecha"]
+    for c in cols:
+        if any(t in _norm(c) for t in tokens):
+            return c
+    return None
+
+def _ensure_attack_start_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee df['Attack Start Time'] exists and is datetime, from any plausible source."""
+    if "Attack Start Time" in df.columns:
+        df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+        return df
+    cand = _find_time_col(df.columns)
+    if cand is None:
+        raise ValueError("Could not find a timestamp column. Include 'Attack Start Time' or a similar field.")
+    s = df[cand]
+    # Try epoch → ms → s → plain parse
+    if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
+        dt_ms = pd.to_datetime(s, unit="ms", errors="coerce")
+        if dt_ms.notna().any():
+            df["Attack Start Time"] = dt_ms
+        else:
+            df["Attack Start Time"] = pd.to_datetime(s, unit="s", errors="coerce")
+    else:
+        df["Attack Start Time"] = pd.to_datetime(s, errors="coerce")
+    return df
 
 
 def process_log_csv_with_progress(

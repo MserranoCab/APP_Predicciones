@@ -345,12 +345,26 @@ def process_log_csv_with_progress(input_path: str, output_path: str, chunksize: 
             if c in df.columns:
                 df[c] = df[c].astype("string")
         table = pa.Table.from_pandas(df, preserve_index=False)
-        if not Path(out_parquet).exists():
-            pq.write_table(table, out_parquet, compression="zstd", use_dictionary=True)
-        else:
-            old = pq.read_table(out_parquet)
-            merged = pa.concat_tables([old, table], promote=True)
-            pq.write_table(merged, out_parquet, compression="zstd", use_dictionary=True)
+        try:
+            if not Path(out_parquet).exists():
+                pq.write_table(table, out_parquet, compression="zstd", use_dictionary=True)
+            else:
+                old = pq.read_table(out_parquet)
+                # Validate schemas
+                if not old.schema.equals(table.schema, check_metadata=False):
+                    st.warning(f"Schema mismatch detected at chunk {i}. Attempting to align...")
+                    # Align schemas by adding missing columns with nulls
+                    for name in old.schema.names:
+                        if name not in table.column_names:
+                            table = table.append_column(name, pa.array([None] * table.num_rows, type=old.schema.field(name).type))
+                    for name in table.column_names:
+                        if name not in old.schema.names:
+                            old = old.append_column(name, pa.array([None] * old.num_rows, type=table.schema.field(name).type))
+                merged = pa.concat_tables([old, table], promote=True)
+                pq.write_table(merged, out_parquet, compression="zstd", use_dictionary=True)
+        except Exception as e:
+            st.error(f"Failed to concatenate tables at chunk {i}: {str(e)}")
+            break
         rows_done += len(df)
         prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
     if not fast_mode:

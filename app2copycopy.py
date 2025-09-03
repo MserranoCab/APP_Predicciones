@@ -20,6 +20,7 @@ import pyarrow.parquet as pq
 import pyarrow.dataset as ds   # (imported for future use)
 import pyarrow.compute as pc
 import pyarrow.types as patypes  # (imported for future use)
+import requests
 
 warnings.filterwarnings("ignore")
 plt.rcParams.update({"figure.autolayout": True})
@@ -85,7 +86,6 @@ THIN_COLS = [
 ]
 
 # ---- Optional: seed dataset from URL in Secrets on first run ----
-import requests
 DATA_URL = st.secrets.get("DATA_URL", "")
 SKIP_BOOTSTRAP = st.secrets.get("SKIP_BOOTSTRAP", "0") == "1"
 
@@ -397,7 +397,6 @@ def _safe_read_thin_parquet(parquet_path: str, want_cols: list[str]) -> pd.DataF
         available = set(pf.schema.names)
         cols = [c for c in want_cols if c in available]
         if not cols:
-            # nothing available; return empty with schema hint
             return pd.DataFrame()
         table = pf.read(columns=cols)
         df = table.to_pandas()
@@ -505,11 +504,8 @@ def process_log_csv_with_progress(
                     else:
                         raise ValueError("CSV must include 'Attack Start Time' column.")
 
-                # Only parse & signature if columns exist (thin ingest may omit some text)
                 df = _vectorized_parse(df)
                 df = map_attack_result(df)
-
-                # You may skip signature in ultra-thin mode, but we keep it:
                 df = create_attack_signature(df)
 
                 ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
@@ -555,7 +551,6 @@ def process_log_csv_with_progress(
                     rollup = g
                 else:
                     rollup = pd.concat([rollup, g], ignore_index=True)
-                    # collapse periodically to keep it small
                     if len(rollup) > 250_000:
                         rollup = rollup.groupby(["Threat Type", "ds"], as_index=False)["y"].sum()
 
@@ -587,7 +582,6 @@ def process_log_csv_with_progress(
     if fast_mode:
         pd.DataFrame({"note": ["Fast mode: resumen omitido."]}).to_csv(output_path, index=False)
     else:
-        # If you really need the recurrence summary, do it here (but it loads full parquet).
         df_all = pq.read_table(out_parquet).to_pandas()
         df_final = calculate_recurrence(df_all)
         df_final = df_final.merge(df_all[["attack_signature", "Day", "Hour"]], on="attack_signature", how="left")
@@ -600,7 +594,6 @@ def process_log_csv_with_progress(
         "fast_mode": fast_mode,
         "counts_path": counts_out,   # tiny hourly roll-up to keep in memory
     }
-
 
 
 # ---------- URL ingest helpers ----------
@@ -648,21 +641,18 @@ def download_url_to_csv(url: str, base_path_no_ext: str) -> str:
             return 'zip'
         if _looks_html(bytes_head):
             return 'html'
-        # If it contains commas and newlines early, we’ll assume csv
         if b',' in bytes_head and b'\n' in bytes_head:
             return 'csv'
         return 'unknown'
 
     def _normalize_direct_download(url: str) -> str:
         url = url.strip()
-        # Dropbox
         if "dropbox.com" in url:
             if "dl=0" in url:
                 url = url.replace("dl=0", "dl=1")
             elif "dl=1" not in url and "raw=1" not in url:
                 sep = "&" if "?" in url else "?"
                 url = f"{url}{sep}dl=1"
-        # Google Drive
         m = re.search(r"drive\.google\.com/file/d/([^/]+)", url)
         if m:
             file_id = m.group(1)
@@ -674,20 +664,14 @@ def download_url_to_csv(url: str, base_path_no_ext: str) -> str:
         return url
 
     def _maybe_handle_gdrive_confirm(session: requests.Session, url: str) -> requests.Response:
-        """
-        First request may return an HTML interstitial with a confirm token.
-        If detected, extract token and re-request the file.
-        """
         r = session.get(url, stream=True, timeout=600)
         r.raise_for_status()
-        # If content-type is HTML or body looks like HTML, try confirm token
         ct = (r.headers.get("content-type") or "").lower()
         if "text/html" in ct:
             txt = r.text
             m = re.search(r'confirm=([0-9A-Za-z\-_]+)', txt)
             if m:
                 token = m.group(1)
-                # append token
                 sep = "&" if "?" in url else "?"
                 url2 = f"{url}{sep}confirm={token}"
                 r.close()
@@ -701,10 +685,7 @@ def download_url_to_csv(url: str, base_path_no_ext: str) -> str:
 
     with st.status("Fetching from URL…", expanded=True) as s:
         with requests.Session() as sess:
-            # Try to handle Google Drive confirm pages
             r = _maybe_handle_gdrive_confirm(sess, url)
-
-            # show progress
             total = int(r.headers.get("content-length", 0))
             done = 0
             prog = st.progress(0.0)
@@ -718,7 +699,6 @@ def download_url_to_csv(url: str, base_path_no_ext: str) -> str:
             prog.empty()
         s.update(label="Download complete", state="complete")
 
-    # Sniff first 4KB
     with open(raw_path, "rb") as fh:
         head = fh.read(4096)
 
@@ -726,7 +706,6 @@ def download_url_to_csv(url: str, base_path_no_ext: str) -> str:
 
     try:
         if kind == "html":
-            # Don’t attempt to parse; tell the user what happened.
             with open(raw_path, "rb") as fh:
                 sample = fh.read(1024).decode(errors="ignore")
             st.error(
@@ -745,24 +724,22 @@ def download_url_to_csv(url: str, base_path_no_ext: str) -> str:
                 names = [n for n in z.namelist() if n.lower().endswith(".csv")]
                 if not names:
                     raise RuntimeError("ZIP file has no CSV inside.")
-                # pick the first CSV
                 with z.open(names[0]) as src, open(csv_path, "wb") as dst:
                     shutil.copyfileobj(src, dst)
 
         else:
-            # Treat as CSV by default (covers plain CSV and many text/csv payloads).
             shutil.move(raw_path, csv_path)
             raw_path = None
 
         return csv_path
 
     finally:
-        # Clean up temp file if still present
         try:
             if raw_path and os.path.exists(raw_path):
                 os.remove(raw_path)
         except Exception:
             pass
+
 
 # ===============================
 # ---- 2) DATA LAYER / CACHE ----
@@ -796,15 +773,12 @@ def _dedupe_events_by_signature_time(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     if "Attack Start Time" in df.columns and "attack_signature" in df.columns:
-        # no sort -> lighter on memory
         return df.drop_duplicates(subset=["Attack Start Time", "attack_signature"], keep="first")
-    # If we lack the signature, skip de-dup here (better to keep rows than to lose them)
     st.caption("Skipping aggressive de-dup because 'attack_signature' not present in the loaded frame.")
     return df
 
 
 def _quick_row_count_footers(parquet_dir: str) -> int:
-    """Sum num_rows from parquet file footers without loading tables."""
     total = 0
     for p in glob.glob(os.path.join(parquet_dir, "*.parquet")):
         try:
@@ -813,6 +787,7 @@ def _quick_row_count_footers(parquet_dir: str) -> int:
         except Exception:
             pass
     return total
+
 
 def _update_master_with_processed(enriched_info):
     """Copy new parquet into master, try to load; quarantine on failure."""
@@ -881,23 +856,17 @@ def build_hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Already aggregated?
     if {"Threat Type", "ds", "y"}.issubset(df.columns):
         out = df.copy()
         out["ds"] = pd.to_datetime(out["ds"], errors="coerce")
-        # NEW: force y numeric, nonnegative
-        out["y"] = pd.to_numeric(out["y"], errors="coerce").fillna(0)
-        out["y"] = out["y"].clip(lower=0)
+        out["y"] = pd.to_numeric(out["y"], errors="coerce").fillna(0).clip(lower=0)
         return out[["Threat Type", "ds", "y"]]
 
-    # Raw → aggregate
     tmp = df.copy()
     tmp["ds"] = pd.to_datetime(tmp["Attack Start Time"], errors="coerce").dt.floor("h")
     tmp["Threat Type"] = tmp.get("Threat Type", "").astype(str)
     grouped = tmp.groupby(["Threat Type", "ds"]).size().reset_index(name="y")
-    # NEW: ensure numeric (size() is already numeric, but keep symmetric)
-    grouped["y"] = pd.to_numeric(grouped["y"], errors="coerce").fillna(0)
-    grouped["y"] = grouped["y"].clip(lower=0)
+    grouped["y"] = pd.to_numeric(grouped["y"], errors="coerce").fillna(0).clip(lower=0)
     return grouped
 
 
@@ -940,11 +909,8 @@ def _merge_extra_columns(grouped: pd.DataFrame, raw_df: pd.DataFrame, threat: st
 
 def _add_time_features(subset: pd.DataFrame) -> pd.DataFrame:
     subset = subset.copy()
-    subset["y"] = pd.to_numeric(subset["y"], errors="coerce").fillna(0)
-    subset["y"] = subset["y"].clip(lower=0)
-
-    subset["y_log"] = np.log1p(subset["y"])
-    subset["hour"] = subset["ds"].dt.hour
+    # robust numeric y → y_log
+    subset["y"] = pd.to_numeric(subset["y"], errors="coerce").fillna(0).clip(lower=0)
     subset["y_log"] = np.log1p(subset["y"])
     subset["hour"] = subset["ds"].dt.hour
     subset["dayofweek"] = subset["ds"].dt.dayofweek
@@ -998,7 +964,7 @@ def _add_lags_rolls(subset: pd.DataFrame, threat: str):
     cfg_src = WINDOW_CONFIG.get(threat, base_cfg)
     cfg = {
         "rolling": int(cfg_src.get("rolling", base_cfg["rolling"])),
-        "lags": [int(l) for l in cfg_src.get("lags", base_cfg["lags"]) if int(l) in (1, 2, 6)],
+        "lags": [int(l) for l in cfg_src.get("lags", base_cfg["lags"]) if int(l) in (1, 2, 6, 24)],
     }
     if not cfg["lags"]:
         cfg["lags"] = [1, 2, 6]
@@ -1019,65 +985,147 @@ def _enough_history(subset, horizon_hours: int) -> bool:
     return len(subset) >= max(200, int(horizon_hours * 3))
 
 
-def train_xgb_for_threat(master_df: pd.DataFrame, threat: str, test_days: int = 7):
+# ---------- NEW: Build hourly features from ALL raw rows ----------
+@st.cache_data(show_spinner=True)
+def build_hourly_features_from_parts(paths: list[str]) -> pd.DataFrame:
+    """Scan every raw row from saved parquet parts and build an hourly feature matrix."""
+    outs = []
+    for p in paths:
+        try:
+            pf = pq.ParquetFile(p)
+            avail = set(pf.schema.names)
+            need = [
+                "Attack Start Time","Threat Type",
+                "Source IP","Destination IP","Attacker","Victim",
+                "duration","attack_result_label","Severity","direction"
+            ]
+            cols = [c for c in need if c in avail]
+            if "Attack Start Time" not in avail or "Threat Type" not in avail:
+                continue
+
+            df = pf.read(columns=cols).to_pandas()
+            df["ds"] = pd.to_datetime(df["Attack Start Time"], errors="coerce").dt.floor("h")
+            df = df.dropna(subset=["ds"])
+            df["Threat Type"] = df["Threat Type"].astype(str)
+            df["cnt"] = 1
+
+            df["duration_num"] = pd.to_numeric(df.get("duration"), errors="coerce")
+            if "attack_result_label" in df.columns:
+                m = {"Attempted": 0, "Successful": 1, 1: 0, 2: 1}
+                df["success_num"] = pd.to_numeric(df["attack_result_label"].map(m), errors="coerce")
+            else:
+                df["success_num"] = np.nan
+
+            agg = {
+                "y": ("cnt", "sum"),
+                "duration_sum": ("duration_num", "sum"),
+                "duration_count": ("duration_num", "count"),
+                "success_sum": ("success_num", "sum"),
+                "success_count": ("success_num", "count"),
+            }
+            if "Source IP" in df.columns:       agg["uniq_src"]      = ("Source IP", pd.Series.nunique)
+            if "Destination IP" in df.columns:  agg["uniq_dst"]      = ("Destination IP", pd.Series.nunique)
+            if "Attacker" in df.columns:        agg["uniq_attacker"] = ("Attacker", pd.Series.nunique)
+            if "Victim" in df.columns:          agg["uniq_victim"]   = ("Victim", pd.Series.nunique)
+
+            g = df.groupby(["Threat Type", "ds"]).agg(**agg).reset_index()
+            outs.append(g)
+
+        except Exception as e:
+            st.warning(f"Skipping part {os.path.basename(p)}: {e}")
+
+    if not outs:
+        return pd.DataFrame(columns=["Threat Type", "ds", "y"])
+
+    feat = pd.concat(outs, ignore_index=True)
+
+    sum_cols = [c for c in [
+        "y","duration_sum","duration_count","success_sum","success_count",
+        "uniq_src","uniq_dst","uniq_attacker","uniq_victim"
+    ] if c in feat.columns]
+    feat = feat.groupby(["Threat Type","ds"], as_index=False)[sum_cols].sum()
+
+    if {"duration_sum","duration_count"}.issubset(feat.columns):
+        feat["duration_mean"] = feat["duration_sum"] / feat["duration_count"].clip(lower=1)
+    if {"success_sum","success_count"}.issubset(feat.columns):
+        feat["success_rate"] = feat["success_sum"] / feat["success_count"].clip(lower=1)
+
+    feat.drop(columns=[c for c in ["duration_sum","duration_count","success_sum","success_count"] if c in feat.columns],
+              inplace=True, errors="ignore")
+
+    feat["y"]  = pd.to_numeric(feat["y"], errors="coerce").fillna(0).clip(lower=0)
+    feat["ds"] = pd.to_datetime(feat["ds"], errors="coerce")
+    return feat
+
+
+def _history_frame(master_df: pd.DataFrame, threat: str) -> pd.DataFrame:
+    """Return the hourly history (with features) for a threat.
+       Prefers rich hourly features if available; fallback to roll-up + thin extras."""
+    hf = st.session_state.get("hourly_features_df")
+    if hf is not None and not hf.empty:
+        sub = hf[hf["Threat Type"] == threat].copy()
+        sub["ds"] = pd.to_datetime(sub["ds"], errors="coerce")
+        for c in ["y","uniq_src","uniq_dst","uniq_attacker","uniq_victim","duration_mean","success_rate",
+                  "Severity","attack_result_label","direction","duration"]:
+            if c in sub.columns:
+                sub[c] = pd.to_numeric(sub[c], errors="coerce").fillna(0)
+        return sub
+
     grouped = build_hourly_counts(master_df)
-    if grouped.empty:
-        return None
-
     sub = grouped[grouped["Threat Type"] == threat].copy()
-    sub["y"] = pd.to_numeric(sub["y"], errors="coerce").fillna(0)
-    sub["y"] = sub["y"].clip(lower=0)
-    if len(sub) < 150:
+    sub["ds"] = pd.to_datetime(sub["ds"], errors="coerce")
+    sub = _merge_extra_columns(sub, master_df, threat)
+    return sub
+
+
+def train_xgb_for_threat(master_df: pd.DataFrame, threat: str, test_days: int = 7):
+    sub = _history_frame(master_df, threat)
+    if sub.empty or len(sub) < 150:
         return None
 
-    thr = sub["y"].quantile(0.98)
-    sub = sub[sub["y"] <= thr]
-    sub["ds"] = pd.to_datetime(sub["ds"], errors="coerce")
+    # Clipping top 2% (configurable via sidebar)
+    clip_q = float(st.session_state.get("clip_q", 0.98))
+    sub["y"] = pd.to_numeric(sub["y"], errors="coerce").fillna(0).clip(lower=0)
+    if clip_q < 1.0:
+        thr = sub["y"].quantile(clip_q)
+        sub = sub[sub["y"] <= thr]
+
     sub = _add_time_features(sub)
-    sub = _merge_extra_columns(sub, master_df, threat)
     sub, cfg = _add_lags_rolls(sub, threat)
 
     feature_cols = [
-        "hour",
-        "dayofweek",
-        "is_weekend",
-        "is_night",
-        "weekofyear",
-        "time_since_last",
-        "Severity",
-        "attack_result_label",
-        "direction",
-        "duration",
+        "hour","dayofweek","is_weekend","is_night","weekofyear","time_since_last"
     ]
-    feature_cols += [c for c in ["lag1", "lag2", "lag6", "lag24"] if c in sub.columns]
-    for c in ["rolling_mean", "rolling_std", "rolling_sum24h"]:
+    # rich features if present
+    for c in ["Severity","attack_result_label","direction","duration",
+              "uniq_src","uniq_dst","uniq_attacker","uniq_victim",
+              "duration_mean","success_rate"]:
+        if c in sub.columns:
+            sub[c] = pd.to_numeric(sub[c], errors="coerce").fillna(0)
+            feature_cols.append(c)
+
+    feature_cols += [c for c in ["lag1","lag2","lag6","lag24"] if c in sub.columns]
+    for c in ["rolling_mean","rolling_std","rolling_sum24h"]:
         if c in sub.columns:
             feature_cols.append(c)
 
-    sub = sub.dropna(subset=feature_cols)
+    sub = sub.dropna(subset=[c for c in feature_cols if c in sub.columns])
     if sub.empty:
         return None
 
     cutoff = sub["ds"].max() - pd.Timedelta(days=test_days)
     train = sub[sub["ds"] <= cutoff]
-    test = sub[sub["ds"] > cutoff]
-
+    test  = sub[sub["ds"] >  cutoff]
     if len(train) < 50 or len(test) < 20:
         return None
 
-    X_full = train[feature_cols]
-    y_full = train["y_log"]
+    X_full = train[feature_cols]; y_full = train["y_log"]
     X_train, X_val, y_train, y_val = train_test_split(X_full, y_full, test_size=0.2, random_state=42)
 
     model = XGBRegressor(
-        n_estimators=1000,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=42,
-        objective="reg:squarederror",
-        n_jobs=4,
+        n_estimators=1000, max_depth=6, learning_rate=0.05,
+        subsample=0.9, colsample_bytree=0.9, random_state=42,
+        objective="reg:squarederror", n_jobs=4
     )
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
@@ -1087,19 +1135,11 @@ def train_xgb_for_threat(master_df: pd.DataFrame, threat: str, test_days: int = 
     resid_std_log = float(np.std(y_val - val_pred_log))
 
     model_path = os.path.join(MODELS_DIR, f"xgb_{re.sub('[^A-Za-z0-9]+', '_', threat)}.joblib")
-    joblib.dump(
-        {"model": model, "features": feature_cols, "cfg": cfg, "resid_std_log": resid_std_log},
-        model_path,
-    )
+    joblib.dump({"model": model, "features": feature_cols, "cfg": cfg, "resid_std_log": resid_std_log}, model_path)
 
-    return {
-        "model_path": model_path,
-        "features": feature_cols,
-        "cfg": cfg,
-        "train": train,
-        "test": test,
-        "validation": {"val_mae": val_mae, "val_rmse": val_rmse, "resid_std_log": resid_std_log},
-    }
+    return {"model_path": model_path, "features": feature_cols, "cfg": cfg,
+            "train": train, "test": test,
+            "validation": {"val_mae": val_mae, "val_rmse": val_rmse, "resid_std_log": resid_std_log}}
 
 
 def forecast_recursive(
@@ -1114,18 +1154,18 @@ def forecast_recursive(
 ):
     rng = np.random.default_rng(seed)
 
-    grouped = build_hourly_counts(master_df)
-    sub = grouped[grouped["Threat Type"] == threat].copy()
-    sub["ds"] = pd.to_datetime(sub["ds"], errors="coerce")
+    sub = _history_frame(master_df, threat)
+    if sub.empty:
+        return None
+
     sub = _add_time_features(sub)
-    sub = _merge_extra_columns(sub, master_df, threat)
     sub, _ = _add_lags_rolls(sub, threat)
 
     feature_cols = model_bundle["features"]
     model = model_bundle["model"]
     resid_std_log = float(model_bundle.get("resid_std_log", 0.10))
 
-    history = sub.dropna(subset=feature_cols).copy().sort_values("ds")
+    history = sub.dropna(subset=[c for c in feature_cols if c in sub.columns]).copy().sort_values("ds")
     if history.empty:
         return None
 
@@ -1175,8 +1215,12 @@ def forecast_recursive(
             "weekofyear": weekofyear,
             "time_since_last": 1.0,
         }
-        for c in ["Severity", "attack_result_label", "direction", "duration"]:
-            row[c] = history[c].iloc[-1] if c in history.columns else 0
+        # carry last known numeric extras if part of features
+        for c in ["Severity","attack_result_label","direction","duration",
+                  "uniq_src","uniq_dst","uniq_attacker","uniq_victim",
+                  "duration_mean","success_rate"]:
+            if c in history.columns:
+                row[c] = float(history[c].iloc[-1])
 
         for c in feature_cols:
             if c.startswith("lag"):
@@ -1196,7 +1240,7 @@ def forecast_recursive(
         else:
             row["rolling_sum24h"] = np.nan
 
-        X_row = pd.DataFrame([row]).dropna(subset=feature_cols)
+        X_row = pd.DataFrame([row]).dropna(subset=[c for c in feature_cols if c in row])
         base_pred_log = ylog_series[-1] if X_row.empty else float(model.predict(X_row[feature_cols])[0])
 
         recent_mean_log = float(pd.Series(ylog_series[-24:]).mean()) if len(ylog_series) >= 24 else float(np.mean(ylog_series))
@@ -1324,7 +1368,7 @@ if fetch_btn and url_in:
         csv_local_path = download_url_to_csv(url_in, base_no_ext)
         st.write(f"Saved to: `{csv_local_path}`")
 
-        # Optional: preview to catch HTML/garbage early
+        # Optional: preview
         st.write("Preview of downloaded file (first ~1KB):")
         with open(csv_local_path, "rb") as fh:
             preview = fh.read(1024).decode(errors="ignore")
@@ -1343,11 +1387,14 @@ if fetch_btn and url_in:
         )
         st.write(f"Rows enriched (RAW): **{result['rows']:,}**")
 
+        # remember the raw part (for full-row training)
+        st.session_state.setdefault("raw_parts", []).append(result["parquet_path"])
+
         # FIRST vs MERGE messaging
         is_first = st.session_state.get("session_master_df", pd.DataFrame()).empty
         st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
 
-        # Load the tiny hourly roll-up returned by the processor
+        # Load the tiny hourly roll-up
         counts_path = result.get("counts_path")
         counts_df = pd.read_csv(counts_path)
         counts_df["ds"] = pd.to_datetime(counts_df["ds"], errors="coerce")
@@ -1427,16 +1474,17 @@ if process_btn and uploaded is not None:
         )
         st.write(f"Filas enriquecidas (RAW): **{result['rows']:,}**")
 
+        # remember the raw part
+        st.session_state.setdefault("raw_parts", []).append(result["parquet_path"])
+
         # FIRST vs MERGE messaging
         is_first = base.empty
         st.write("Starting session dataset…" if is_first else "Merging into session dataset…")
 
-        # Load the tiny hourly roll-up returned by the processor
         counts_path = result.get("counts_path")
         counts_df = pd.read_csv(counts_path)
         counts_df["ds"] = pd.to_datetime(counts_df["ds"], errors="coerce")
 
-        # Start/merge the session roll-up
         merged = pd.concat([base, counts_df], ignore_index=True)
         merged = merged.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
         st.session_state["session_master_df"] = merged
@@ -1506,7 +1554,6 @@ with st.sidebar:
         st.write(f"Threat Types ({len(tt_list)}):")
         st.write(", ".join(tt_list[:30]) + (" ..." if len(tt_list) > 30 else ""))
 
-        # Downloads of the current session dataset
         p_parq, p_csv = _session_master_download_paths()
         if os.path.exists(p_parq):
             st.download_button(
@@ -1524,6 +1571,22 @@ with st.sidebar:
             )
     else:
         st.info("No data yet. Upload or fetch to get started.")
+
+    st.markdown("---")
+    st.subheader("Hourly features")
+    if st.button("Build from raw rows (uses every row)"):
+        parts = st.session_state.get("raw_parts", [])
+        if not parts:
+            st.warning("No raw parts recorded yet. Ingest a file first.")
+        else:
+            with st.spinner("Scanning parquet parts and building hourly features…"):
+                hf = build_hourly_features_from_parts(parts)
+            st.session_state["hourly_features_df"] = hf
+            st.success(f"Hourly features ready: {len(hf):,} rows")
+
+    st.caption("Clipping (trim extreme spikes before training)")
+    clip_q = st.slider("Recorte superior (cuantil)", min_value=0.90, max_value=0.999, value=0.98, step=0.001)
+    st.session_state["clip_q"] = float(clip_q)
 
     st.markdown("---")
     if st.button("↻ Clear caches"):
@@ -1626,11 +1689,10 @@ st.divider()
 st.subheader("Notas & Guardrails")
 st.markdown(
     """
-- **Valores atípicos**: se recorta el 2% superior de los recuentos por hora.
+- **Valores atípicos**: recorte superior por cuantil (por defecto 0.98).
 - **Límites de horizonte**: 7/14/30 días con comprobación de suficiencia del historial.
-- **Funciones adicionales** (`Severity`, `attack_result_label`, `direction`, `duration`) se fusionan por hora cuando están disponibles.
+- **Entrenamiento completo (opcional)**: *Build from raw rows* usa **todas** las filas para construir señales por hora (IPs únicas, duración media, tasa de éxito).
 - **Modo solo sesión**: nada se persiste a disco; descarga el **dataset de sesión** cuando quieras.
-- **(Opcional)**: si desactivas el modo solo sesión, los datos se guardan en `data/master_parquet/` y se reutilizan en reinicios.
 """
 )
 

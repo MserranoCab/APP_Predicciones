@@ -11,6 +11,7 @@ import streamlit as st
 import shutil
 import gzip
 import io
+import zipfile
 from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -257,7 +258,7 @@ def create_attack_signature(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def calculate_recurrence(df: pd.DataFrame) -> pd.DataFrame:
-    df['Attack Start Time'] = pd.to_datetime(df['Attack Start Time'], errors='coerce')
+    df['Attack Start Time'] = pd.to_datetime(df['Attack Start Time'], errors="coerce")
     grouped = df.groupby('attack_signature')
     first_rows = grouped.first().reset_index()
     agg_info = grouped['Attack Start Time'].agg(['min', 'max', 'count']).reset_index()
@@ -411,7 +412,7 @@ def _coverage_stats(df: pd.DataFrame):
 
 def _discover_seed_paths() -> list:
     candidates = []
-    env_paths = os.environ.get("CYBER_SEED_CSVS", "")
+    env_paths = os.environ.get("CYBER_SEED_CVS", "")
     if env_paths:
         candidates.extend([p.strip() for p in env_paths.split(",") if p.strip()])
     candidates.extend(glob.glob(os.path.join(SEEDS_DIR, "*.csv")))
@@ -616,7 +617,7 @@ def forecast_recursive(
     rng = np.random.default_rng(seed)
     grouped = build_hourly_counts(master_df)
     sub = grouped[grouped['Threat Type'] == threat].copy()
-    sub['ds'] = pd.to_datetime(sub['ds'], errors='coerce')
+    sub['ds'] = pd.to_datetime(sub['ds'], errors="coerce")
     sub = _add_time_features(sub)
     sub = _merge_extra_columns(sub, master_df, threat)
     sub, cfg = _add_lags_rolls(sub, threat)
@@ -737,7 +738,7 @@ def pretrain_models(master_df: pd.DataFrame):
 # ---- STREAMLIT UI --------
 # ===========================
 st.title("🛡️ Predicción de Ataques")
-st.caption("Subir CSV (o .gz) → Procesar → Entrenar → Predecir")
+st.caption("Subir CSV, ZIP (con CSV) o .gz → Procesar → Entrenar → Predecir")
 
 if "seed_done" not in st.session_state:
     with st.status("Initializing data (first run only)…", expanded=True) as s:
@@ -780,7 +781,7 @@ with st.sidebar:
             except Exception as e:
                 st.warning(f"Could not read legacy master.csv: {e}")
     else:
-        st.info("No data yet. Upload a CSV or compressed .gz file to get started.")
+        st.info("No data yet. Upload a CSV, ZIP (with CSV), or compressed .gz file to get started.")
     if st.button("↻ Clear caches"):
         st.cache_data.clear()
         st.cache_resource.clear()
@@ -792,9 +793,9 @@ with st.sidebar:
 # -----------------------
 st.subheader("1) Agrega Información para Entrenar el Modelo")
 st.markdown("""
-Sube un archivo CSV o comprimido (.gz). Archivos grandes (>200MB) se procesan automáticamente en partes.
-- **Recomendación**: Comprime tu CSV a .gz para archivos grandes (reduce el tamaño significativamente).
-- **No se requiere acción adicional**: El sistema maneja archivos grandes de forma transparente.
+Sube un archivo CSV, ZIP (conteniendo un CSV), o comprimido (.gz). Archivos grandes (>200MB descomprimidos) se procesan automáticamente en partes.
+- **Recomendación**: Comprime tu CSV a .gz o ZIP para archivos grandes (reduce el tamaño significativamente).
+- **Nota**: En Streamlit Community Cloud, el límite es 200MB. Para archivos más grandes descomprimidos, usa despliegue local con la configuración recomendada o asegúrate de que el archivo comprimido (ZIP/.gz) sea <200MB.
 """)
 
 # Performance controls
@@ -802,7 +803,7 @@ fast_mode = st.toggle("🚀 Carga rápida (omite resumen de recurrencia)", value
 chunksize_opt = st.select_slider("Tamaño de chunk para procesar", options=[100_000, 150_000, 200_000, 250_000, 300_000], value=250_000, format_func=lambda x: f"{x:,} filas")
 
 # File Upload
-uploaded_file = st.file_uploader("Subir CSV o .gz", type=["csv", "gz"])
+uploaded_file = st.file_uploader("Subir CSV, ZIP o .gz", type=["csv", "zip", "gz"])
 
 # Process Button
 colA, colB = st.columns([1, 1])
@@ -819,17 +820,30 @@ if process_btn and uploaded_file:
 
     with st.status("Procesando archivo…", expanded=True) as status:
         raw_path = os.path.join(DATA_DIR, f"upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        if uploaded_file.name.endswith(".gz"):
+        
+        if uploaded_file.name.endswith(".zip"):
+            with zipfile.ZipFile(uploaded_file, "r") as zip_ref:
+                csv_name = [name for name in zip_ref.namelist() if name.endswith(".csv")]
+                if not csv_name:
+                    st.error("No CSV file found in the ZIP archive.")
+                    status.update(label="Error: No CSV in ZIP", state="error")
+                    st.stop()
+                csv_name = csv_name[0]
+                raw_path += ".csv"
+                with zip_ref.open(csv_name) as f_in, open(raw_path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
+        elif uploaded_file.name.endswith(".gz"):
             raw_path += ".csv"
             with gzip.open(uploaded_file, "rb") as f_in, open(raw_path, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
-        else:
+        else:  # CSV
             raw_path += ".csv"
             with open(raw_path, "wb") as f_out:
                 shutil.copyfileobj(uploaded_file, f_out, length=16 * 1024 * 1024)
+
         file_size_mb = os.path.getsize(raw_path) / (1024 * 1024)
         if file_size_mb > 200:
-            st.warning(f"Archivo grande ({file_size_mb:.2f}MB). Procesando en partes. Considera comprimir a .gz para cargas más rápidas.")
+            st.warning(f"Archivo descomprimido grande ({file_size_mb:.2f}MB). Procesando en partes. Asegúrate de que el archivo comprimido (ZIP/.gz) sea <200MB en Streamlit Community Cloud.")
         processed_path = os.path.join(PROCESSED_DIR, outname)
         result = process_log_csv_with_progress(raw_path, processed_path, chunksize=chunksize_opt, fast_mode=fast_mode)
         master = _update_master_with_processed(result)
@@ -883,7 +897,7 @@ else:
             with st.spinner(f"Entrenando {threat}…"):
                 bundle = train_xgb_for_threat(master, threat, test_days=7)
             if bundle is None:
-                st.error(f"No hay suficientes datos válidos para**{threat}**.")
+                st.error(f"No hay suficientes datos válidos para **{threat}**.")
                 continue
             saved = load_model_cached(bundle["model_path"])
             model_bundle = {
@@ -936,9 +950,9 @@ else:
 st.divider()
 st.subheader("Notas y Limitaciones")
 st.markdown("""
-- **Archivos grandes**: Archivos >200MB se procesan en partes automáticamente. Usa .gz para reducir el tamaño y acelerar la carga.
+- **Archivos grandes**: Archivos descomprimidos >200MB se procesan en partes automáticamente. Asegúrate de que el archivo comprimido (ZIP/.gz) sea <200MB en Streamlit Community Cloud.
 - **Persistencia**: Los datos procesados se añaden a `data/master_parquet/` como partes Parquet.
 - **Consejo**: Ajusta el tamaño de chunk si encuentras problemas de memoria.
-- **Despliegue**: En Streamlit Community Cloud, archivos muy grandes pueden requerir compresión (.gz) debido a límites del servidor.
+- **Despliegue**: Para archivos descomprimidos >200MB, considera un despliegue local con `server.maxUploadSize` configurado (ver instrucciones).
 """)
 st.caption("© Streamlit + XGBoost")

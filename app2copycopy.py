@@ -1,30 +1,24 @@
 # app.py — Cyber Attack Forecasting Tool (Streamlit + XGBoost)
-# ——————————————————————————————————————————————————————————————
-# - Robust timestamp inference (no more "Attack Start Time missing")
-# - Thin-ingest keeps any time-ish column automatically
-# - Processes EVERY ROW → builds hourly counts in-memory (lightweight)
-# - Trims extreme spikes before training (top-quantile slider)
-# - XGBoost per-threat forecaster with recent-mean damping and noise
+# Full build: streaming ingest (every row) → hourly counts in session →
+# training (with clipping) → recursive forecast (damped + noise + spikes).
+# Robust timestamp detection & optional persistent parquet-part machinery.
 
-import os
-import re
-import glob
-import joblib
-import warnings
-import datetime as dt
+import os, re, glob, shutil, warnings, datetime as dt
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-import shutil
-from pathlib import Path
+import joblib
+
 from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-# Optional but handy if you later export snapshots
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pyarrow.compute as pc
 
 warnings.filterwarnings("ignore")
 plt.rcParams.update({"figure.autolayout": True})
@@ -32,28 +26,45 @@ plt.rcParams.update({"figure.autolayout": True})
 # =========================
 # ---- CONFIG / STORAGE ----
 # =========================
-STATELESS_ONLY = True  # session-only roll-up (recommended for big CSVs)
 st.set_page_config(page_title="Cyber Attacks Forecaster", page_icon="🛡️", layout="wide")
 
-DATA_DIR      = "data"
-MODELS_DIR    = "models"
-PLOTS_DIR     = "plots"
-PROCESSED_DIR = "processed"
+# Toggle to keep *only* session memory (no persistent master parts written)
+STATELESS_ONLY = True
 
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
-os.makedirs(PLOTS_DIR, exist_ok=True)
-os.makedirs(PROCESSED_DIR, exist_ok=True)
+DATA_DIR       = "data"
+MODELS_DIR     = "models"
+PLOTS_DIR      = "plots"
+PROCESSED_DIR  = "processed"
+SEEDS_DIR      = "seeds"
+MASTER_DS_DIR  = os.path.join(DATA_DIR, "master_parquet")   # persistent parquet parts
+SESSION_SNAP   = os.path.join(DATA_DIR, "session_master.parquet")
+SESSION_CSV    = os.path.join(DATA_DIR, "session_master.csv")
+ENRICH_SUFFIX_PARQUET = "_enriched_raw.parquet"
 
-# ===========================
-# ---- UTILS / HELPERS  -----
-# ===========================
+for d in [DATA_DIR, MODELS_DIR, PLOTS_DIR, PROCESSED_DIR, SEEDS_DIR, MASTER_DS_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+# Minimal columns when thin-ingesting CSVs (case-insensitive matching)
+THIN_INPUT_COLS = {
+    "Attack Start Time", "First Seen", "Start Time", "Event Time", "Timestamp", "Time",
+    "Threat Type", "Threat Name", "Threat Subtype", "Severity",
+    "Source IP", "Destination IP", "Attacker", "Victim",
+    "Addition Info", "attack_result", "direction", "duration",
+}
+
+# =========================
+# ---- UTILITIES ----------
+# =========================
+def make_usecols_callable(keep_cols: set[str]):
+    lower_keep = {c.lower() for c in keep_cols}
+    def _f(colname: str) -> bool:
+        return (colname in keep_cols) or (str(colname).lower() in lower_keep)
+    return _f
 
 def _normalize_and_uniquify_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = [str(c).strip() for c in df.columns]
     if len(cols) != len(set(cols)):
-        seen = {}
-        new_cols = []
+        seen, new_cols = {}, []
         for c in cols:
             k = seen.get(c, 0)
             new_cols.append(c if k == 0 else f"{c}.{k}")
@@ -63,191 +74,278 @@ def _normalize_and_uniquify_columns(df: pd.DataFrame) -> pd.DataFrame:
         df.columns = cols
     return df
 
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+def coalesce_columns(base: pd.DataFrame, extra: pd.DataFrame) -> pd.DataFrame:
+    base = base.copy()
+    for c in extra.columns:
+        if c in base.columns:
+            base[c] = base[c].where(base[c].notna(), extra[c])
+        else:
+            base[c] = extra[c]
+    return base
 
-TIME_CANDIDATES_EXACT = [
-    "Attack Start Time", "Attack Start Time (UTC)",
-    "First Seen", "First Seen (UTC)",
-    "Start Time", "Event Time", "EventTime",
-    "Timestamp", "@timestamp", "Time", "Datetime",
-    "Date", "LogTime", "Event Received Time"
+def get_first_series(df: pd.DataFrame, name: str):
+    if name not in df.columns:
+        return None
+    obj = df[name]
+    return obj.iloc[:, 0] if isinstance(obj, pd.DataFrame) else obj
+
+# =========================
+# ---- TIME HANDLING  -----
+# =========================
+_TIME_CANDIDATES = [
+    "Attack Start Time", "First Seen", "Start Time", "Event Time", "EventTime",
+    "timestamp", "time", "datetime", "date", "log_time", "occurred_at",
+    "Time Generated", "Receive Time", "generated_time", "StartTime",
 ]
 
-def _find_time_col(cols) -> str | None:
-    # 1) exact/synonym match (case/punct insensitive)
-    norm_map = {_norm(c): c for c in cols}
-    for name in TIME_CANDIDATES_EXACT:
-        k = _norm(name)
-        if k in norm_map:
-            return norm_map[k]
-    # 2) fuzzy tokens
-    tokens = ["timestamp", "firstseen", "attackstart", "starttime", "eventtime",
-              "time", "datetime", "date", "fecha", "fechahora"]
-    for c in cols:
-        if any(t in _norm(c) for t in tokens):
-            return c
-    return None
-
 def _ensure_attack_start_time(df: pd.DataFrame) -> pd.DataFrame:
-    """Guarantee df['Attack Start Time'] exists and is datetime, from any plausible source."""
-    if "Attack Start Time" in df.columns:
-        df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
-        return df
+    """Create/normalize 'Attack Start Time' from many possible columns (case-insensitive)."""
+    df = df.copy()
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
 
-    cand = _find_time_col(df.columns)
-    if cand is None:
+    candidate_actual = None
+    for cand in _TIME_CANDIDATES:
+        if cand.lower() in lower_map:
+            candidate_actual = lower_map[cand.lower()]
+            break
+
+    if candidate_actual is None:
+        # Heuristic: any column whose name contains 'time' or 'date'
+        for c in df.columns:
+            cl = str(c).lower()
+            if "time" in cl or "date" in cl or "stamp" in cl:
+                candidate_actual = c
+                break
+
+    if candidate_actual is None:
         raise ValueError(
-            "Could not find a timestamp column. Include 'Attack Start Time' or a similar field "
-            "(e.g., 'First Seen', '@timestamp', 'Event Time', epoch, etc.)."
+            "No timestamp column found. Expected one of: "
+            + ", ".join(_TIME_CANDIDATES)
+            + ". Available: "
+            + ", ".join(map(str, df.columns[:40]))
         )
-    s = df[cand]
-    # Epoch? Try ms → s → else generic parse
-    if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
-        dt_ms = pd.to_datetime(s, unit="ms", errors="coerce")
-        if dt_ms.notna().any():
-            df["Attack Start Time"] = dt_ms
-        else:
-            df["Attack Start Time"] = pd.to_datetime(s, unit="s", errors="coerce")
-    else:
-        df["Attack Start Time"] = pd.to_datetime(s, errors="coerce")
 
+    ts = pd.to_datetime(df[candidate_actual], errors="coerce", utc=False, infer_datetime_format=True)
+    if ts.isna().mean() > 0.5:
+        # Try alternate parsing styles if the first pass failed a lot
+        ts = pd.to_datetime(df[candidate_actual], errors="coerce", utc=False, dayfirst=True)
+    df["Attack Start Time"] = ts
     return df
 
-# --------- Thin ingest: keep known + time-ish columns ----------
-THIN_INPUT_COLS = {
-    "Attack Start Time", "First Seen",
-    "Threat Type", "Threat Name", "Threat Subtype",
-    "Severity", "Source IP", "Destination IP",
-    "Attacker", "Victim", "Addition Info",
-    "attack_result", "direction", "duration",
-}
+# =========================
+# ---- ENRICHMENT ----------
+# =========================
+_addinfo_re = re.compile(r'type=(?P<key>[^ \t]+)\s+value=(?P<val>[^;,\n]+)')
 
-def make_usecols_callable(keep_cols: set[str]):
-    """Keep known columns AND anything that looks like a timestamp so thin ingest never drops it."""
-    lower_keep = {c.lower() for c in keep_cols}
-    time_tokens = [
-        "time", "timestamp", "@timestamp", "first seen", "first_seen",
-        "start time", "event time", "datetime", "fecha", "date", "logtime"
-    ]
-    def _f(colname: str) -> bool:
-        name = str(colname); lname = name.lower()
-        if (name in keep_cols) or (lname in lower_keep):
-            return True
-        if any(tok in lname for tok in time_tokens):
-            return True
-        return False
-    return _f
+def parse_addition_info_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "Addition Info" not in df.columns:
+        df["Addition Info"] = np.nan
+        return df
+    s = df["Addition Info"].fillna("")
+    ext = (
+        s.str.extractall(_addinfo_re)
+        .reset_index()
+        .rename(columns={"level_0": "row", "key": "k", "val": "v"})
+    )
+    if ext.empty:
+        return df
+    wide = ext.pivot(index="row", columns="k", values="v")
+    wide.columns = [str(c).strip() for c in wide.columns]
+    wide = wide.reset_index()
+    out = (
+        df.reset_index(drop=True)
+          .reset_index()
+          .merge(wide, left_on="index", right_on="row", how="left")
+          .drop(columns=["index", "row"])
+    )
+    return out
 
-# ===============================
-# ---- 1) INGEST (EVERY ROW) ----
-# ===============================
+def map_attack_result(df: pd.DataFrame) -> pd.DataFrame:
+    result_map = {"1": "Attempted", "2": "Successful", 1: "Attempted", 2: "Successful"}
+    s = get_first_series(df, "attack_result")
+    df["attack_result_label"] = s.map(result_map) if s is not None else np.nan
+    return df
 
-def process_csv_to_hourly_counts(
-    input_path: str,
-    chunksize: int = 250_000,
-    usecols_filter=None,
-) -> dict:
+def create_attack_signature(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Threat Name", "Threat Type", "Threat Subtype", "Severity",
+            "Source IP", "Destination IP", "Attacker", "Victim"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    df["attack_signature"] = df[cols].astype(str).agg("|".join, axis=1)
+    return df
+
+# =========================
+# ---- SESSION MASTER -----
+# =========================
+def _session_counts() -> pd.DataFrame:
+    return st.session_state.get("session_counts_df", pd.DataFrame(columns=["Threat Type","ds","y"]))
+
+def _set_session_counts(df: pd.DataFrame):
+    st.session_state["session_counts_df"] = df
+
+def _session_downloads():
+    df = _session_counts().copy()
+    if df.empty:
+        return None, None
+    try:
+        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), SESSION_SNAP, compression="zstd")
+    except Exception:
+        pass
+    try:
+        df.to_csv(SESSION_CSV, index=False)
+    except Exception:
+        pass
+    return (SESSION_SNAP if os.path.exists(SESSION_SNAP) else None,
+            SESSION_CSV if os.path.exists(SESSION_CSV) else None)
+
+def _coverage_stats_counts(df: pd.DataFrame):
+    if df.empty: return None
+    ts = pd.to_datetime(df["ds"], errors="coerce").dropna()
+    if ts.empty: return None
+    return ts.min().date(), ts.max().date(), len(df)
+
+# =========================
+# ---- PERSISTENT MASTER (OPTIONAL) ----
+# =========================
+def _add_part_to_master(parquet_path: str):
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dst = os.path.join(MASTER_DS_DIR, f"part-{ts}.parquet")
+    shutil.copyfile(parquet_path, dst)
+    return dst
+
+def _read_master_parquet_unified() -> pd.DataFrame:
+    """Reads all parquet parts in MASTER_DS_DIR with schema unification."""
+    parts = sorted(glob.glob(os.path.join(MASTER_DS_DIR, "*.parquet")))
+    if not parts:
+        return pd.DataFrame()
+    # Scan schemas
+    def norm_type(t: pa.DataType) -> pa.DataType:
+        if pa.types.is_dictionary(t): return t.value_type
+        return t
+    def tag(t: pa.DataType) -> str:
+        t = norm_type(t)
+        if pa.types.is_string(t) or pa.types.is_large_string(t): return "str"
+        if pa.types.is_timestamp(t): return "ts"
+        if pa.types.is_floating(t): return "float"
+        if pa.types.is_integer(t): return "int"
+        if pa.types.is_boolean(t): return "bool"
+        return "other"
+
+    observed, samples = {}, {}
+    good = []
+    for p in parts:
+        try:
+            t = pq.read_table(p)
+            for f in t.schema:
+                observed.setdefault(f.name, set()).add(tag(f.type))
+                samples.setdefault(f.name, norm_type(f.type))
+            good.append(p)
+        except Exception:
+            continue
+    if not good:
+        return pd.DataFrame()
+
+    targets: dict[str, pa.DataType] = {}
+    for name, tags in observed.items():
+        if name == "Attack Start Time":
+            targets[name] = pa.large_string()
+            continue
+        if tags == {"int"}:
+            targets[name] = pa.int64()
+        elif tags == {"float"} or tags == {"int", "float"}:
+            targets[name] = pa.float64()
+        elif tags == {"ts"}:
+            targets[name] = pa.timestamp("ns")
+        elif "str" in tags:
+            targets[name] = pa.large_string()
+        else:
+            targets[name] = pa.large_string()
+
+    tables = []
+    for p in good:
+        t = pq.read_table(p)
+        arrays, names = [], []
+        n = t.num_rows
+        for name, target in targets.items():
+            if name in t.column_names:
+                col = t[name]
+                if hasattr(col, "chunks"):
+                    chs = [pc.cast(ch, target) for ch in col.chunks]
+                    arr = pa.chunked_array(chs, type=target)
+                else:
+                    arr = pc.cast(col, target)
+            else:
+                arr = pa.nulls(n, type=target)
+            arrays.append(arr); names.append(name)
+        tables.append(pa.table(arrays, names=names))
+
+    if not tables:
+        return pd.DataFrame()
+
+    table = pa.concat_tables(tables, promote=True)
+    df = table.to_pandas()
+    if "Attack Start Time" in df.columns:
+        df["Attack Start Time"] = pd.to_datetime(df["Attack Start Time"], errors="coerce")
+    return df
+
+# =========================
+# ---- STREAMING INGEST ----
+# =========================
+def process_csv_to_hourly_counts(csv_path: str, chunksize: int = 250_000, usecols_filter=None):
     """
-    Stream-read the raw CSV in chunks, infer timestamp robustly, and build a compact
-    hourly counts DF: ['Threat Type','ds','y'] (ds is hourly).
-    Returns dict with:
-      - 'counts_path' : CSV path with hourly counts
-      - 'rows'        : total raw rows processed
+    Stream-read the CSV in chunks and aggregate to hourly counts.
+    Returns (hourly_df, rows_done). *Every row* is used.
     """
     prog = st.progress(0.0, text="Leyendo CSV…")
     rows_done = 0
+    hourly = None
 
-    rollup = None  # ["Threat Type","ds","y"]
-
-    reader = pd.read_csv(
-        input_path,
-        low_memory=False,
-        chunksize=chunksize,
-        usecols=usecols_filter,  # callable or None
-    )
-
-    for i, df in enumerate(reader):
+    for i, df in enumerate(pd.read_csv(csv_path, low_memory=False, chunksize=chunksize, usecols=usecols_filter)):
         df = _normalize_and_uniquify_columns(df)
-        df = _ensure_attack_start_time(df)
+        df = _ensure_attack_start_time(df)     # ← FIX: tolerant timestamp detection
+        df = parse_addition_info_column(df)
+        df = map_attack_result(df)
+        df = create_attack_signature(df)
 
-        # Coerce Threat Type to string; missing → "Unknown"
-        if "Threat Type" not in df.columns:
-            df["Threat Type"] = "Unknown"
-        df["Threat Type"] = df["Threat Type"].astype(str).fillna("Unknown")
-
-        # Build hourly bins
         ts = pd.to_datetime(df["Attack Start Time"], errors="coerce")
-        g = pd.DataFrame({
-            "Threat Type": df["Threat Type"].astype(str),
-            "ds": ts.dt.floor("h"),
-        })
-        g = g.dropna(subset=["ds"])
-        g = g.groupby(["Threat Type", "ds"]).size().reset_index(name="y")
+        df["ds"] = ts.dt.floor("h")
 
-        if rollup is None:
-            rollup = g
+        tt = df.get("Threat Type")
+        if tt is None:
+            # try another typical variant
+            tt = df.get("threat_type") if "threat_type" in df.columns else pd.Series([""] * len(df))
+        df["Threat Type"] = tt.astype(str)
+
+        g = (
+            df.dropna(subset=["ds"])
+              .groupby(["Threat Type","ds"])
+              .size()
+              .reset_index(name="y")
+        )
+
+        if hourly is None:
+            hourly = g
         else:
-            rollup = pd.concat([rollup, g], ignore_index=True)
-            # periodically collapse to keep small
-            if len(rollup) > 300_000:
-                rollup = rollup.groupby(["Threat Type", "ds"], as_index=False)["y"].sum()
+            hourly = pd.concat([hourly, g], ignore_index=True)
+            if len(hourly) > 300_000:
+                hourly = hourly.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
 
         rows_done += len(df)
         prog.progress(min(0.99, 0.02 + i * 0.02), text=f"Procesadas ~{rows_done:,} filas")
 
-    if rollup is None:
-        rollup = pd.DataFrame(columns=["Threat Type", "ds", "y"])
+    if hourly is None:
+        hourly = pd.DataFrame(columns=["Threat Type","ds","y"])
     else:
-        rollup = rollup.groupby(["Threat Type", "ds"], as_index=False)["y"].sum()
-    rollup["ds"] = pd.to_datetime(rollup["ds"], errors="coerce")
-
-    # Persist a tiny CSV for download/debug
-    counts_out = os.path.join(PROCESSED_DIR, f"hourly_counts_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-    rollup.to_csv(counts_out, index=False)
+        hourly = hourly.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
+        hourly["ds"] = pd.to_datetime(hourly["ds"], errors="coerce")
 
     prog.progress(1.0, text=f"¡Listo! Total procesado: {rows_done:,} filas")
-    return {"counts_path": counts_out, "rows": rows_done}
+    return hourly, rows_done
 
-# ==================================
-# ---- 2) DATA LAYER (SESSION)  ----
-# ==================================
-
-def _append_session_rollup(new_counts: pd.DataFrame) -> pd.DataFrame:
-    base = st.session_state.get("session_master_df")
-    if base is None or base.empty:
-        st.session_state["session_master_df"] = new_counts
-    else:
-        merged = pd.concat([base, new_counts], ignore_index=True)
-        merged = merged.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
-        st.session_state["session_master_df"] = merged
-    return st.session_state["session_master_df"]
-
-def _session_master_df() -> pd.DataFrame:
-    return st.session_state.get("session_master_df", pd.DataFrame())
-
-def build_hourly_counts(df: pd.DataFrame) -> pd.DataFrame:
-    """If already a roll-up, just normalize; else derive from raw (not used here)."""
-    if df.empty:
-        return df
-    if {"Threat Type","ds","y"}.issubset(df.columns):
-        out = df.copy()
-        out["ds"] = pd.to_datetime(out["ds"], errors="coerce")
-        return out[["Threat Type","ds","y"]]
-    # Fallback path (not expected with this app flow)
-    tmp = df.copy()
-    tmp["ds"] = pd.to_datetime(tmp["Attack Start Time"], errors="coerce").dt.floor("h")
-    tmp["Threat Type"] = tmp.get("Threat Type","Unknown").astype(str)
-    return tmp.groupby(["Threat Type","ds"]).size().reset_index(name="y")
-
-@st.cache_data(show_spinner=False)
-def hourly_counts_cached(df: pd.DataFrame):
-    return build_hourly_counts(df)
-
-# ============================================
-# ---- 3) FEATURES / MODEL / FORECASTING  ----
-# ============================================
-
+# =========================
+# ---- FEATURES / MODEL ----
+# =========================
 WINDOW_CONFIG = {
     "DoS": {"rolling": 3, "lags": [1, 2]},
     "Scan": {"rolling": 6, "lags": [1, 2, 6]},
@@ -257,82 +355,57 @@ WINDOW_CONFIG = {
     "Malfile": {"rolling": 3, "lags": [1, 2]},
 }
 
-def _merge_extra_columns(grouped: pd.DataFrame, raw_df: pd.DataFrame, threat: str) -> pd.DataFrame:
-    """We only have roll-up; add neutral columns so the model shape is stable."""
-    merged = grouped.copy()
-    for c in ["Severity", "attack_result_label", "direction", "duration"]:
-        merged[c] = 0
-    return merged
+def _add_time_features(sub: pd.DataFrame) -> pd.DataFrame:
+    sub = sub.copy()
+    sub["y"] = pd.to_numeric(sub["y"], errors="coerce").fillna(0)
+    sub["y_log"] = np.log1p(sub["y"])
+    sub["hour"] = sub["ds"].dt.hour
+    sub["dayofweek"] = sub["ds"].dt.dayofweek
+    sub["is_weekend"] = sub["dayofweek"].isin([5,6]).astype(int)
+    sub["is_night"] = (sub["hour"].lt(7) | sub["hour"].gt(21)).astype(int)
+    sub["weekofyear"] = sub["ds"].dt.isocalendar().week.astype(int)
+    sub["time_since_last"] = sub["ds"].diff().dt.total_seconds().div(3600).fillna(0)
+    return sub
 
-def _add_time_features(subset: pd.DataFrame) -> pd.DataFrame:
-    subset = subset.copy()
-    subset["y_log"] = np.log1p(subset["y"])
-    subset["hour"] = subset["ds"].dt.hour
-    subset["dayofweek"] = subset["ds"].dt.dayofweek
-    subset["is_weekend"] = subset["dayofweek"].isin([5, 6]).astype(int)
-    subset["is_night"] = subset["hour"].apply(lambda x: 1 if x < 7 or x > 21 else 0)
-    subset["weekofyear"] = subset["ds"].dt.isocalendar().week.astype(int)
-    subset["time_since_last"] = subset["ds"].diff().dt.total_seconds().div(3600).fillna(0)
-    return subset
-
-def _add_lags_rolls(subset: pd.DataFrame, threat: str):
-    subset = subset.copy()
-    base_cfg = {"rolling": 3, "lags": [1, 2, 6]}
-    cfg_src = WINDOW_CONFIG.get(threat, base_cfg)
-    cfg = {
-        "rolling": int(cfg_src.get("rolling", base_cfg["rolling"])),
-        "lags": [int(l) for l in cfg_src.get("lags", base_cfg["lags"]) if int(l) in (1, 2, 6)],
-    }
+def _add_lags_rolls(sub: pd.DataFrame, threat: str):
+    sub = sub.copy()
+    cfg_src = WINDOW_CONFIG.get(threat, {"rolling": 3, "lags": [1,2,6]})
+    cfg = {"rolling": int(cfg_src.get("rolling", 3)),
+           "lags": [int(l) for l in cfg_src.get("lags", [1,2,6]) if int(l) in (1,2,6,24)]}
     if not cfg["lags"]:
-        cfg["lags"] = [1, 2, 6]
-
+        cfg["lags"] = [1,2,6]
     for lag in cfg["lags"]:
-        subset[f"lag{lag}"] = subset["y_log"].shift(lag)
+        sub[f"lag{lag}"] = sub["y_log"].shift(lag)
+    sub["rolling_mean"] = sub["y_log"].rolling(cfg["rolling"]).mean().shift(1)
+    sub["rolling_std"]  = sub["y_log"].rolling(cfg["rolling"]).std().shift(1)
+    return sub, cfg
 
-    subset["rolling_mean"] = subset["y_log"].rolling(cfg["rolling"]).mean().shift(1)
-    subset["rolling_std"]  = subset["y_log"].rolling(cfg["rolling"]).std().shift(1)
+def _enough_history(sub, horizon_hours: int) -> bool:
+    return len(sub) >= max(200, int(horizon_hours * 3))
 
-    # Ensure no stray column remains from past versions
-    if "rolling_sum24h" in subset.columns:
-        subset = subset.drop(columns=["rolling_sum24h"])
-
-    return subset, cfg
-
-def _enough_history(subset, horizon_hours: int) -> bool:
-    return len(subset) >= max(200, int(horizon_hours * 3))
-
-def train_xgb_for_threat(master_df: pd.DataFrame, threat: str, clip_q: float = 0.98, test_days: int = 7):
-    grouped = build_hourly_counts(master_df)
-    if grouped.empty:
-        return None
-
-    sub = grouped[grouped["Threat Type"] == threat].copy()
+def train_xgb_for_threat(hourly_all: pd.DataFrame, threat: str, clip_q: float = 0.98, test_days: int = 7):
+    sub = hourly_all[hourly_all["Threat Type"] == threat].copy()
     if len(sub) < 150:
         return None
 
-    # Trim extreme spikes BEFORE feature building (you asked for top 2%)
-    thr = sub["y"].quantile(float(clip_q))
-    sub = sub[sub["y"] <= thr]
+    # Clip extreme spikes (you control clip_q in the UI)
+    if 0.5 < clip_q < 1.0 and "y" in sub.columns and len(sub) > 10:
+        thr = sub["y"].quantile(clip_q)
+        sub = sub[sub["y"] <= thr]
 
     sub["ds"] = pd.to_datetime(sub["ds"], errors="coerce")
     sub = _add_time_features(sub)
-    sub = _merge_extra_columns(sub, master_df, threat)
     sub, cfg = _add_lags_rolls(sub, threat)
 
     feature_cols = [
         "hour","dayofweek","is_weekend","is_night","weekofyear","time_since_last",
-        "Severity","attack_result_label","direction","duration",
-    ]
-    feature_cols += [c for c in ["lag1","lag2","lag6","lag24"] if c in sub.columns]
-    for c in ["rolling_mean", "rolling_std"]:
-        if c in sub.columns:
-            feature_cols.append(c)
+    ] + [c for c in ["lag1","lag2","lag6","lag24","rolling_mean","rolling_std"] if c in sub.columns]
 
     sub = sub.dropna(subset=feature_cols)
     if sub.empty:
         return None
 
-    cutoff = sub["ds"].max() - pd.Timedelta(days=int(test_days))
+    cutoff = sub["ds"].max() - pd.Timedelta(days=test_days)
     train = sub[sub["ds"] <= cutoff]
     test  = sub[sub["ds"] >  cutoff]
     if len(train) < 50 or len(test) < 20:
@@ -340,25 +413,22 @@ def train_xgb_for_threat(master_df: pd.DataFrame, threat: str, clip_q: float = 0
 
     X_full = train[feature_cols]
     y_full = train["y_log"]
-    X_train, X_val, y_train, y_val = train_test_split(X_full, y_full, test_size=0.2, random_state=42)
+    X_tr, X_val, y_tr, y_val = train_test_split(X_full, y_full, test_size=0.2, random_state=42)
 
     model = XGBRegressor(
         n_estimators=1000, max_depth=6, learning_rate=0.05,
         subsample=0.9, colsample_bytree=0.9, random_state=42,
         objective="reg:squarederror", n_jobs=4,
     )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
 
     val_pred_log = model.predict(X_val)
-    val_mae  = float(np.mean(np.abs(np.expm1(val_pred_log) - np.expm1(y_val))))
+    val_mae = float(np.mean(np.abs(np.expm1(val_pred_log) - np.expm1(y_val))))
     val_rmse = float(np.sqrt(np.mean((np.expm1(val_pred_log) - np.expm1(y_val))**2)))
     resid_std_log = float(np.std(y_val - val_pred_log))
 
     model_path = os.path.join(MODELS_DIR, f"xgb_{re.sub('[^A-Za-z0-9]+','_', threat)}.joblib")
-    joblib.dump(
-        {"model": model, "features": feature_cols, "cfg": cfg, "resid_std_log": resid_std_log},
-        model_path,
-    )
+    joblib.dump({"model": model, "features": feature_cols, "cfg": cfg, "resid_std_log": resid_std_log}, model_path)
 
     return {
         "model_path": model_path,
@@ -369,54 +439,43 @@ def train_xgb_for_threat(master_df: pd.DataFrame, threat: str, clip_q: float = 0
         "validation": {"val_mae": val_mae, "val_rmse": val_rmse, "resid_std_log": resid_std_log},
     }
 
-def forecast_recursive(
-    master_df: pd.DataFrame,
-    threat: str,
-    horizon_days: int,
-    model_bundle: dict,
-    seasonality_strength: float | None = None,
-    noise_level: float | None = None,
-    spike_prob: float | None = None,
-    seed: int = 1234,
-):
+def forecast_recursive(hourly_all: pd.DataFrame, threat: str, horizon_days: int, model_bundle: dict,
+                       seasonality_strength: float = 0.60, noise_level: float = 0.35, spike_prob: float = 0.02, seed: int = 1234):
     rng = np.random.default_rng(seed)
 
-    grouped = build_hourly_counts(master_df)
-    sub = grouped[grouped["Threat Type"] == threat].copy()
+    sub = hourly_all[hourly_all["Threat Type"] == threat].copy()
     sub["ds"] = pd.to_datetime(sub["ds"], errors="coerce")
     sub = _add_time_features(sub)
-    sub = _merge_extra_columns(sub, master_df, threat)
-    sub, _ = _add_lags_rolls(sub, threat)
+    sub, cfg = _add_lags_rolls(sub, threat)
 
-    feature_cols  = model_bundle["features"]
-    model         = model_bundle["model"]
+    feature_cols = model_bundle["features"]
+    model = model_bundle["model"]
     resid_std_log = float(model_bundle.get("resid_std_log", 0.10))
 
     history = sub.dropna(subset=feature_cols).copy().sort_values("ds")
     if history.empty:
         return None
 
-    horizon_hours = int(horizon_days * 24)
-    if not _enough_history(history, horizon_hours):
-        return {"insufficient_history": True, "needed": max(200, horizon_hours * 3), "available": len(history)}
-
-    # Auto-tune if not provided
-    if seasonality_strength is None or noise_level is None or spike_prob is None:
-        tail = history.tail(min(len(history), 24*14))
-        by_hour = tail.groupby(tail["ds"].dt.hour)["y_log"].mean()
-        amp = float(by_hour.max() - by_hour.min()) if not by_hour.empty else 0.0
-        seasonality_strength = float(np.clip(amp / 1.2, 0.30, 0.85)) if seasonality_strength is None else seasonality_strength
-        noise_level = float(np.clip(resid_std_log / 0.35, 0.15, 0.60)) if noise_level is None else noise_level
-
+    # Simple auto-tune if defaults are None
+    tail = history.tail(min(len(history), 24*14))
+    by_hour = tail.groupby(tail["ds"].dt.hour)["y_log"].mean()
+    if not by_hour.empty and seasonality_strength is None:
+        amp = float(by_hour.max() - by_hour.min())
+        seasonality_strength = float(np.clip(amp / 1.2, 0.30, 0.85))
+    if noise_level is None:
+        noise_level = float(np.clip(resid_std_log / 0.35, 0.15, 0.60))
+    if spike_prob is None:
         y_tail = np.expm1(tail["y_log"])
         if len(y_tail) >= 24:
-            med = float(np.median(y_tail))
-            mad = float(np.median(np.abs(y_tail - med))) + 1e-9
-            spikes = int(np.sum(y_tail > med + 6 * mad))
-            sp_est = spikes / max(1, len(y_tail))
+            med = float(np.median(y_tail)); mad = float(np.median(np.abs(y_tail - med))) + 1e-9
+            sp_est = np.mean(y_tail > med + 6 * mad)
         else:
             sp_est = 0.01
-        spike_prob = float(np.clip(sp_est, 0.005, 0.08)) if spike_prob is None else spike_prob
+        spike_prob = float(np.clip(sp_est, 0.005, 0.08))
+
+    horizon_hours = int(horizon_days * 24)
+    if not _enough_history(history, horizon_hours):
+        return {"insufficient_history": True, "needed": max(200, horizon_hours*3), "available": len(history)}
 
     max_lag = max([int(x[3:]) for x in feature_cols if x.startswith("lag")] + [1])
     buffer_points = max(max_lag + 24, 30)
@@ -427,19 +486,14 @@ def forecast_recursive(
     rows = []
     for _ in range(horizon_hours):
         ds_next = ds_last + pd.Timedelta(hours=1)
-        hour = ds_next.hour
-        dayofweek = ds_next.dayofweek
-        is_weekend = int(dayofweek in [5, 6])
-        is_night = 1 if hour < 7 or hour > 21 else 0
-        weekofyear = int(pd.Timestamp(ds_next).isocalendar().week)
-
         row = {
             "ds": ds_next,
-            "hour": hour, "dayofweek": dayofweek,
-            "is_weekend": is_weekend, "is_night": is_night,
-            "weekofyear": weekofyear,
+            "hour": ds_next.hour,
+            "dayofweek": ds_next.dayofweek,
+            "is_weekend": int(ds_next.dayofweek in [5,6]),
+            "is_night": int(ds_next.hour < 7 or ds_next.hour > 21),
+            "weekofyear": int(pd.Timestamp(ds_next).isocalendar().week),
             "time_since_last": 1.0,
-            "Severity": 0, "attack_result_label": 0, "direction": 0, "duration": 0,
         }
         for c in feature_cols:
             if c.startswith("lag"):
@@ -458,11 +512,12 @@ def forecast_recursive(
         base_pred_log = ylog_series[-1] if X_row.empty else float(model.predict(X_row[feature_cols])[0])
 
         recent_mean_log = float(pd.Series(ylog_series[-24:]).mean()) if len(ylog_series) >= 24 else float(np.mean(ylog_series))
-        blended_log = seasonality_strength * base_pred_log + (1.0 - seasonality_strength) * recent_mean_log
+        damp = seasonality_strength if seasonality_strength is not None else 0.60
+        blended_log = damp * base_pred_log + (1.0 - damp) * recent_mean_log
 
-        noise = rng.normal(loc=0.0, scale=resid_std_log * noise_level)
-        if rng.random() < spike_prob:
-            noise += rng.normal(0.0, resid_std_log * 2.5 * noise_level)
+        noise = rng.normal(0.0, resid_std_log * (noise_level if noise_level is not None else 0.35))
+        if rng.random() < (spike_prob if spike_prob is not None else 0.02):
+            noise += rng.normal(0.0, resid_std_log * 2.5 * (noise_level if noise_level is not None else 0.35))
 
         y_pred_log = blended_log + noise
         ylog_series.append(y_pred_log)
@@ -471,168 +526,197 @@ def forecast_recursive(
 
     return pd.DataFrame(rows)
 
-def plot_recent_and_forecast(threat: str, recent_actual: pd.DataFrame, fcst_df: pd.DataFrame, lookback_hours: int = 48, title_suffix: str = ""):
+def plot_recent_and_forecast(threat, recent_actual, fcst_df, lookback_hours=48, title_suffix=""):
     fig, ax = plt.subplots(figsize=(12, 5))
     if recent_actual is not None and not recent_actual.empty:
         ax.plot(recent_actual["ds"], recent_actual["y"], label=f"Actual (last {lookback_hours}h)")
     if fcst_df is not None and not fcst_df.empty:
         ax.plot(fcst_df["ds"], fcst_df["y_hat"], label="Forecast", linewidth=2)
     ax.set_title(f"{threat} — Hourly Attacks {title_suffix}")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Count")
-    ax.legend()
+    ax.set_xlabel("Time"); ax.set_ylabel("Count"); ax.legend()
     return fig
 
-@st.cache_resource(show_spinner=False)
-def load_model_cached(path: str):
-    return joblib.load(path)
+# =========================
+# ---- UI  ----------------
+# =========================
+st.title("🛡️ Predicción de Ataques (Full)")
 
-# ===========================
-# ---- 4) STREAMLIT UI  -----
-# ===========================
+st.info("**Modo solo sesión** activado: el dataset se mantiene en memoria. Descárgalo si necesitas persistencia.")
 
-st.title("🛡️ Predicción de Ataques")
-st.caption("Subir Información → Procesar (cada fila) → Entrenar → Predecir")
-
-# Sidebar: current data status + controls
+# Sidebar controls
 with st.sidebar:
-    st.header("📦 Data Status")
-    master = _session_master_df()
-    if not master.empty and {"Threat Type","ds","y"}.issubset(master.columns):
-        start = pd.to_datetime(master["ds"], errors="coerce").min()
-        end   = pd.to_datetime(master["ds"], errors="coerce").max()
-        st.success(f"Data from **{start.date()}** to **{end.date()}**  \nRows (hour bins): **{len(master):,}**")
-        tt_list = sorted(map(str, master["Threat Type"].dropna().unique()))
-        st.write(f"Threat Types ({len(tt_list)}):")
-        st.write(", ".join(tt_list[:30]) + (" ..." if len(tt_list) > 30 else ""))
-        # download current session roll-up
-        snap = os.path.join(DATA_DIR, "session_master.csv")
-        master.to_csv(snap, index=False)
-        st.download_button("⬇️ Download session master.csv", data=open(snap,"rb").read(),
-                           file_name="session_master.csv", mime="text/csv")
-    else:
-        st.info("No data yet. Upload or fetch to get started.")
+    st.header("Hourly features")
+    st.caption("Clipping (trim extreme spikes before training)")
+    clip_q = st.slider("Recorte superior (cuantil)", 0.90, 0.999, 0.98, 0.001)
 
     st.markdown("---")
-    st.caption("Hourly features")
-    st.button("Build from raw rows (uses every row)", disabled=True)
-    clip_q = st.slider(
-        "Recorte superior (cuantil)",
-        min_value=0.90, max_value=0.999, value=0.98, step=0.001,
-        help="Recorta picos antes de entrenar (por amenaza)."
-    )
-    st.session_state["clip_q"] = float(clip_q)
+    st.caption("Forecast behavior")
+    damp = st.slider("Seasonality strength (0=flat, 1=full)", 0.0, 1.0, 0.60, 0.05)
+    noise = st.slider("Noise level", 0.0, 1.0, 0.35, 0.05)
+    spike = st.slider("Spike probability", 0.0, 0.2, 0.02, 0.005)
+
+    st.markdown("---")
+    p_parq, p_csv = _session_downloads()
+    if p_parq:
+        st.download_button("⬇️ Download session master.parquet", data=open(p_parq, "rb").read(),
+                           file_name="session_master.parquet", mime="application/octet-stream")
+    if p_csv:
+        st.download_button("⬇️ Download session master.csv", data=open(p_csv, "rb").read(),
+                           file_name="session_master.csv", mime="text/csv")
 
     st.markdown("---")
     if st.button("↻ Clear caches"):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.session_state.pop("session_master_df", None)
-        st.success("Caches cleared. Reloading…")
-        st.experimental_rerun()
+        st.cache_data.clear(); st.cache_resource.clear()
+        st.success("Caches cleared. Reloading…"); st.experimental_rerun()
 
-# -----------------------
-# 1) Upload & Processing
-# -----------------------
+# Ingest controls
 st.subheader("1) Agrega Información para Entrenar el Modelo")
-st.write("Sube un CSV sin procesar → se **procesará** y se **agregará** al **dataset de sesión** (roll-up por hora).")
+uploaded = st.file_uploader("Subir CSV (exportación BDS sin procesar)", type=["csv"])
 
-uploaded = st.file_uploader("Subir CSV (exportación BDS u otra)", type=["csv"])
+thin_ingest = st.toggle("🪶 Thin ingest (usar solo columnas relevantes)", True,
+                        help="Lee solo columnas necesarias para hora, tipo y firma; reduce memoria.")
+chunksize_opt = st.select_slider("Tamaño de chunk", options=[100_000,150_000,200_000,250_000,300_000],
+                                 value=250_000, format_func=lambda x: f"{x:,} filas")
 
-thin_ingest = st.toggle(
-    "🪶 Thin ingest (usar solo columnas relevantes + cualquier columna de tiempo)",
-    value=True,
-    help="Mantiene columnas clave y cualquier columna que parezca timestamp; acelera lecturas grandes."
-)
-chunksize_opt = st.select_slider(
-    "Tamaño de chunk para procesar",
-    options=[100_000, 150_000, 200_000, 250_000, 300_000],
-    value=250_000,
-    format_func=lambda x: f"{x:,} filas",
-)
-
-# Optional URL ingest (Dropbox/Drive/HTTP)
-st.markdown("**O pega un enlace directo (Dropbox / Google Drive / HTTPS):**")
-url_in = st.text_input("URL a un CSV (o .gz/.zip con un CSV dentro)", placeholder="https://…")
+# URL path
+st.markdown("**O pega un enlace (HTTPS/Dropbox/Google Drive)**")
+url_in = st.text_input("URL a CSV (o .gz/.zip con CSV dentro)", placeholder="https://…")
 fetch_btn = st.button("Fetch & Merge from URL", use_container_width=True, disabled=not url_in)
 
+def _normalize_direct_download(url: str) -> str:
+    url = url.strip()
+    if "dropbox.com" in url:
+        if "dl=0" in url: url = url.replace("dl=0","dl=1")
+        elif "dl=1" not in url and "raw=1" not in url:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}dl=1"
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)", url)
+    if m:
+        fid = m.group(1); url = f"https://drive.google.com/uc?export=download&id={fid}"
+    m = re.search(r"drive\.google\.com/open\?id=([^&]+)", url)
+    if m:
+        fid = m.group(1); url = f"https://drive.google.com/uc?export=download&id={fid}"
+    return url
+
+def download_url_to_csv(url: str, base_no_ext: str) -> str:
+    import requests, gzip, zipfile
+    url = _normalize_direct_download(url)
+    raw_path = f"{base_no_ext}__raw.bin"
+    csv_path = f"{base_no_ext}.csv"
+    with st.status("Fetching from URL…", expanded=True):
+        with requests.get(url, stream=True, timeout=600) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0)); done = 0
+            prog = st.progress(0.0)
+            with open(raw_path, "wb") as f:
+                for ch in r.iter_content(chunk_size=8*1024*1024):
+                    if ch:
+                        f.write(ch); done += len(ch)
+                        if total: prog.progress(min(done/total, 1.0))
+            prog.empty()
+    # sniff first bytes
+    with open(raw_path, "rb") as fh: head = fh.read(4096)
+    def looks_html(b: bytes) -> bool:
+        h = b.strip().lower(); return h.startswith(b'<!doctype html') or h.startswith(b'<html')
+    kind = ("gz" if head[:2]==b'\x1f\x8b' else
+            "zip" if head[:4]==b'PK\x03\x04' else
+            "html" if looks_html(head) else "csv")
+    try:
+        if kind == "html":
+            st.error("Downloaded HTML (Drive warning page). Provide a direct file link.")
+            raise RuntimeError("HTML instead of CSV")
+        elif kind == "gz":
+            with gzip.open(raw_path, "rb") as src, open(csv_path, "wb") as dst: shutil.copyfileobj(src, dst)
+        elif kind == "zip":
+            with zipfile.ZipFile(raw_path) as z:
+                names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+                if not names: raise RuntimeError("ZIP has no CSV")
+                with z.open(names[0]) as src, open(csv_path, "wb") as dst: shutil.copyfileobj(src, dst)
+        else:
+            shutil.move(raw_path, csv_path); raw_path = None
+        return csv_path
+    finally:
+        try:
+            if raw_path and os.path.exists(raw_path): os.remove(raw_path)
+        except Exception:
+            pass
+
 def _handle_ingest(csv_path: str):
-    before = _session_master_df()
-    before_bins = len(before) if not before.empty else 0
-
-    with st.status("Reading & enriching (session mode)…", expanded=True) as status:
-        usecols_cb = make_usecols_callable(THIN_INPUT_COLS) if thin_ingest else None
-        result = process_csv_to_hourly_counts(csv_path, chunksize=chunksize_opt, usecols_filter=usecols_cb)
-
-        counts_df = pd.read_csv(result["counts_path"])
-        counts_df["ds"] = pd.to_datetime(counts_df["ds"], errors="coerce")
-
-        merged = _append_session_rollup(counts_df)
-        after_bins = len(merged)
-
-        status.update(label="Merge complete ✅ (session only; nothing persisted permanently)", state="complete")
-
-    st.metric("Events ingested (raw rows)", value=f"{result['rows']:,}")
-    st.metric("Hourly bins in memory", value=f"{after_bins:,}", delta=f"+{after_bins - before_bins:,}")
+    usecols_cb = make_usecols_callable(THIN_INPUT_COLS) if thin_ingest else None
+    hourly, rows = process_csv_to_hourly_counts(csv_path, chunksize=chunksize_opt, usecols_filter=usecols_cb)
+    base = _session_counts()
+    merged = pd.concat([base, hourly], ignore_index=True)
+    merged = merged.groupby(["Threat Type","ds"], as_index=False)["y"].sum()
+    _set_session_counts(merged)
+    # persist session snapshots for download buttons
+    _session_downloads()
+    return rows, len(merged)
 
 if fetch_btn and url_in:
-    # Minimal downloader (no special Google Drive handling here to keep code short)
-    import requests, tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmpf:
-        with st.spinner("Downloading…"):
-            r = requests.get(url_in, timeout=600)
-            r.raise_for_status()
-            tmpf.write(r.content)
-        tmp_path = tmpf.name
-    _handle_ingest(tmp_path)
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_no_ext = os.path.join(DATA_DIR, f"remote_{ts}")
+    csv_local = download_url_to_csv(url_in, base_no_ext)
+    rows, bins = _handle_ingest(csv_local)
+    st.success(f"Ingested **{rows:,}** rows → hourly bins in memory: **{bins:,}**")
 
+# File upload path
 colA, colB = st.columns([1,1])
 with colA:
-    st.write("")  # spacer
+    default_name = dt.datetime.now().strftime("processed_%Y%m%d_%H%M%S.csv")
+    outname = st.text_input("Nombre del archivo procesado (solo para referencia)", value=default_name)
 with colB:
-    process_btn = st.button("Process & Merge (from uploaded file)", type="primary", use_container_width=True, disabled=uploaded is None)
+    process_btn = st.button("Process & Merge", type="primary", use_container_width=True, disabled=uploaded is None)
 
 if process_btn and uploaded is not None:
     raw_path = os.path.join(DATA_DIR, f"upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     uploaded.seek(0)
     with open(raw_path, "wb") as dst:
-        shutil.copyfileobj(uploaded, dst, length=16 * 1024 * 1024)
-    _handle_ingest(raw_path)
+        shutil.copyfileobj(uploaded, dst, length=16*1024*1024)
+    rows, bins = _handle_ingest(raw_path)
+    st.success(f"Ingested **{rows:,}** rows → hourly bins in memory: **{bins:,}**")
 
+# Data status
 st.divider()
+st.subheader("Data Status (session)")
+counts = _session_counts()
+cov = _coverage_stats_counts(counts)
+if cov:
+    start, end, n = cov
+    st.success(f"Data from **{start}** to **{end}** — hourly rows: **{n:,}**")
+    if not counts.empty:
+        tt_list = sorted(map(str, counts["Threat Type"].dropna().unique()))
+        st.write(f"Threat Types ({len(tt_list)}): " + ", ".join(tt_list[:30]) + (" ..." if len(tt_list) > 30 else ""))
+else:
+    st.info("No data yet. Upload or fetch to get started.")
 
-# -----------------------
-# 2) Training & Forecast
-# -----------------------
-st.subheader("2) Entrenar el modelo y generar predicciones")
+# =========================
+# ---- TRAIN & FORECAST ----
+# =========================
+st.divider()
+st.subheader("2) Entrenar y Pronosticar")
 
-master = _session_master_df()
-if master.empty:
+if counts.empty:
     st.warning("Cargue y procese al menos un CSV primero.")
 else:
-    threats = sorted(map(str, master["Threat Type"].dropna().unique()))
-    chosen = st.multiselect("Elija los tipos de amenazas para entrenar", options=threats, default=threats[:1])
+    threats = sorted(map(str, counts["Threat Type"].dropna().unique()))
+    chosen = st.multiselect("Tipos de amenazas", options=threats, default=threats[:1])
 
-    horizon_choice = st.select_slider("Horizonte de previsión", options=[7, 14, 30], value=7, format_func=lambda d: f"{d} days")
-    lookback_hours = st.select_slider(
-        "Historial real para mostrar antes del pronóstico",
-        options=[24, 48, 72, 96, 120, 144, 168],
-        value=48,
-        format_func=lambda h: f"{h//24} días",
-    )
+    horizon_choice = st.select_slider("Horizonte", options=[7,14,30], value=7, format_func=lambda d: f"{d} días")
+    lookback_hours = st.select_slider("Historial real a mostrar", options=[24,48,72,96,120,144,168],
+                                      value=48, format_func=lambda h: f"{h//24} días")
 
-    run_btn = st.button("Entrene y Pronostico", type="primary", use_container_width=True, disabled=len(chosen) == 0)
+    run_btn = st.button("Entrenar y Pronosticar", type="primary", use_container_width=True, disabled=len(chosen)==0)
 
     if run_btn:
-        grouped_all = hourly_counts_cached(master)
         for threat in chosen:
             with st.spinner(f"Entrenando {threat}…"):
-                bundle = train_xgb_for_threat(master, threat, clip_q=st.session_state.get("clip_q", 0.98), test_days=7)
+                bundle = train_xgb_for_threat(counts, threat, clip_q=clip_q, test_days=7)
+
             if bundle is None:
                 st.error(f"No hay suficientes datos válidos para **{threat}**.")
                 continue
 
-            saved = load_model_cached(bundle["model_path"])
+            saved = joblib.load(bundle["model_path"])
             model_bundle = {
                 "model": saved["model"],
                 "features": saved["features"],
@@ -640,66 +724,54 @@ else:
                 "resid_std_log": saved.get("resid_std_log", 0.10),
             }
 
-            fcst = forecast_recursive(master, threat, horizon_days=int(horizon_choice), model_bundle=model_bundle)
+            fcst = forecast_recursive(
+                counts, threat, horizon_days=int(horizon_choice),
+                model_bundle=model_bundle,
+                seasonality_strength=damp, noise_level=noise, spike_prob=spike
+            )
+
             if isinstance(fcst, dict) and fcst.get("insufficient_history"):
                 st.warning(
-                    f"**{threat}**: No hay suficiente historial con funciones listas para usar {horizon_choice}d "
-                    f"(needed ~{fcst['needed']}, available {fcst['available']}). Prueba con un horizonte menor."
+                    f"**{threat}**: historial insuficiente para {horizon_choice}d "
+                    f"(necesita ~{fcst['needed']}, disponible {fcst['available']})."
                 )
                 continue
 
-            grouped = grouped_all[grouped_all["Threat Type"] == threat].copy()
-            grouped["ds"] = pd.to_datetime(grouped["ds"], errors="coerce")
+            g = counts[counts["Threat Type"] == threat].copy()
+            g["ds"] = pd.to_datetime(g["ds"], errors="coerce")
 
-            fcst_start = fcst["ds"].min() if fcst is not None and not fcst.empty else grouped["ds"].max() + pd.Timedelta(hours=1)
-            recent_actual = grouped[
-                (grouped["ds"] >= fcst_start - pd.Timedelta(hours=lookback_hours)) & (grouped["ds"] < fcst_start)
-            ]
+            fcst_start = fcst["ds"].min() if fcst is not None and not fcst.empty else g["ds"].max() + pd.Timedelta(hours=1)
+            recent_actual = g[(g["ds"] >= fcst_start - pd.Timedelta(hours=lookback_hours)) & (g["ds"] < fcst_start)]
 
-            fig = plot_recent_and_forecast(
-                threat,
-                recent_actual,
-                fcst,
-                lookback_hours=lookback_hours,
-                title_suffix=f"(+{horizon_choice}d)",
-            )
+            fig = plot_recent_and_forecast(threat, recent_actual, fcst, lookback_hours=lookback_hours,
+                                           title_suffix=f"(+{horizon_choice}d)")
             st.pyplot(fig)
 
-            # Save artifacts for download
             plot_path = os.path.join(PLOTS_DIR, f"{re.sub('[^A-Za-z0-9]+','_', threat)}_{horizon_choice}d.png")
             fig.savefig(plot_path, dpi=160)
-            csv_path = os.path.join(PLOTS_DIR, f"{re.sub('[^A-Za-z0-9]+','_', threat)}_{horizon_choice}d_fcst.csv")
-            if fcst is not None and not fcst.empty:
-                fcst.to_csv(csv_path, index=False)
+            csv_path  = os.path.join(PLOTS_DIR, f"{re.sub('[^A-Za-z0-9]+','_', threat)}_{horizon_choice}d_fcst.csv")
+            fcst.to_csv(csv_path, index=False)
 
             val = bundle["validation"]
-            st.caption(f"Validation (internal, last split): MAE={val['val_mae']:.2f}  |  RMSE={val['val_rmse']:.2f}")
+            st.caption(f"Validation (last split): MAE={val['val_mae']:.2f} | RMSE={val['val_rmse']:.2f}")
 
             c1, c2 = st.columns(2)
             with c1:
-                if os.path.exists(csv_path):
-                    st.download_button(
-                        "⬇️ Download forecast CSV",
-                        data=open(csv_path, "rb").read(),
-                        file_name=os.path.basename(csv_path),
-                        mime="text/csv",
-                    )
+                st.download_button("⬇️ Download forecast CSV", data=open(csv_path,"rb").read(),
+                                   file_name=os.path.basename(csv_path), mime="text/csv")
             with c2:
-                st.download_button(
-                    "⬇️ Download plot PNG",
-                    data=open(plot_path, "rb").read(),
-                    file_name=os.path.basename(plot_path),
-                    mime="image/png",
-                )
+                st.download_button("⬇️ Download plot PNG", data=open(plot_path,"rb").read(),
+                                   file_name=os.path.basename(plot_path), mime="image/png")
 
 st.divider()
 st.subheader("Notas & Guardrails")
-st.markdown(
-    """
-- **Se procesa cada fila** del CSV y se agrega por hora (Threat Type × hora).
-- **Recorte de atípicos**: slider para recortar el **cuantil superior** (por defecto 0.98) **antes de entrenar**.
-- **Horizontes**: 7/14/30 días con verificación de historial suficiente.
-- **Modo sesión**: los datos viven en memoria; descarga `session_master.csv` si quieres persistirlos.
-"""
-)
+st.markdown("""
+- **Cada fila cuenta**: el roll-up horario se construye directamente del CSV crudo (no se pierde detalle).
+- **Recorte de extremos**: ajusta el cuantil superior (por defecto 0.98) para domar picos.
+- **Pronóstico**: mezcla del modelo con media reciente (controlada por *Seasonality strength*),
+  ruido proporcional al error de validación y picos ocasionales configurables.
+- **Modo sesión**: datos en memoria; usa los botones de descarga de la barra lateral.
+- **Opcional persistencia**: si desactivas STATELESS_ONLY y llamas _add_part_to_master(...) puedes crear
+  un *dataset maestro* en `data/master_parquet/` y leerlo con `_read_master_parquet_unified()`.
+""")
 st.caption("© Streamlit + XGBoost")
